@@ -6,7 +6,7 @@ extends Node
 const Room := preload("res://room.gd")
 const CODE_CHARS := "ABCDEFGHJKLMNPQRSTUVWXYZ"
 const MAX_VOICE_BYTES := 4096
-const DEFAULT_NAMES := {"ar": "لاعب", "ru": "Игрок", "en": "Player"}
+const DEFAULT_NAMES := {"ar": "لاعب", "ru": "Игрок", "en": "Player", "tr": "Oyuncu", "de": "Spieler"}
 
 
 class Client:
@@ -127,7 +127,12 @@ func _handle(c: Client, text: String) -> void:
 		"start":
 			err = "not_in_room" if room == null else room.start(c.id)
 		"settings":
-			err = "not_in_room" if room == null else room.set_pace(c.id, str(m.get("pace", "")))
+			if room == null:
+				err = "not_in_room"
+			elif m.has("pace"):
+				err = room.set_pace(c.id, str(m.pace))
+			elif m.has("mafia"):
+				err = room.set_mafia(c.id, int(m.mafia))
 		"act":
 			err = "not_in_room" if room == null else room.act(c.id, str(m.get("target", "")))
 		"skip":

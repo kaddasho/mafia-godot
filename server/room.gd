@@ -23,6 +23,7 @@ var is_public: bool
 var max_players: int
 
 var pace: String = "medium"
+var mafia_count: int = 0  # 0 = automatic
 var phase: String = "lobby"
 var deadline: int = 0
 var auto_start_at: int = 0
@@ -146,6 +147,24 @@ func set_pace(by: String, value: String) -> String:
 	pace = value
 	broadcast()
 	return ""
+
+
+## Host's mafia count: 0 = automatic, 1..3 = fixed (capped by max_mafia() when the game starts).
+func set_mafia(by: String, value: int) -> String:
+	if phase != "lobby":
+		return "room_in_progress"
+	if by != host_id:
+		return "not_host"
+	if value < 0 or value > 3:
+		return "bad_value"
+	mafia_count = value
+	broadcast()
+	return ""
+
+
+## Mafia must start as a clear minority, otherwise they win at once.
+static func max_mafia(n: int) -> int:
+	return maxi(1, mini(3, (n - 1) / 2))
 
 
 func _ms(phase_name: String) -> int:
@@ -278,6 +297,8 @@ func _begin_game() -> void:
 
 func _role_list(n: int) -> Array[String]:
 	var mafia := 1 if n < 6 else (2 if n < 9 else 3)
+	if mafia_count > 0:
+		mafia = mini(mafia_count, max_mafia(n))
 	var roles: Array[String] = []
 	for i in mafia:
 		roles.append("mafia")
@@ -502,6 +523,8 @@ func view_for(me: Dictionary) -> Dictionary:
 		"name": name,
 		"isPublic": is_public,
 		"pace": pace,
+		"mafia": mafia_count,
+		"mafiaMax": max_mafia(players.size()),
 		"max": max_players,
 		"phase": phase,
 		"round": round_no,
