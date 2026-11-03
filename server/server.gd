@@ -101,7 +101,9 @@ func _handle(c: Client, text: String) -> void:
 			_leave(c, false)
 			var max_count := clampi(int(m.get("maxPlayers", 8)), Room.MIN_PLAYERS, 12)
 			var player_name := _clean_name(m)
-			err = _enter_room(c, _new_room(player_name, bool(m.get("isPublic", false)), max_count), player_name)
+			var created := _new_room(player_name, bool(m.get("isPublic", false)), max_count)
+			created.lang = str(m.get("lang", ""))
+			err = _enter_room(c, created, player_name)
 		"join":
 			_leave(c, false)
 			var target: Room = _rooms.get(str(m.get("code", "")).strip_edges().to_upper())
@@ -116,7 +118,15 @@ func _handle(c: Client, text: String) -> void:
 					break
 			if target == null:
 				target = _new_room(player_name, true, 8)
+				target.lang = str(m.get("lang", ""))
+				target.auto_start = true  # quick-play rooms start themselves; hosted rooms wait for the host
 			err = _enter_room(c, target, player_name)
+		"list":
+			var listed := []
+			for r: Room in _rooms.values():
+				if r.is_public and r.is_open():
+					listed.append(r.summary())
+			_send(c.id, {"t": "rooms", "rooms": listed})
 		"resume":
 			_resume(c, str(m.get("token", "")))
 		"leave":

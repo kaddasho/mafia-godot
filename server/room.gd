@@ -22,6 +22,8 @@ var name: String
 var is_public: bool
 var max_players: int
 
+var lang: String = ""  # creator's language, shown in the public room list
+var auto_start: bool = false  # quick-play rooms start on their own once enough players are in
 var pace: String = "medium"
 var mafia_count: int = 0  # 0 = automatic
 var phase: String = "lobby"
@@ -72,6 +74,12 @@ func is_empty() -> bool:
 
 func is_open() -> bool:
 	return phase == "lobby" and players.size() < max_players
+
+
+## One line of the public room list.
+func summary() -> Dictionary:
+	return {"code": code, "name": name, "players": players.size(), "max": max_players,
+		"lang": lang, "pace": pace, "mafia": mafia_count}
 
 
 # --- lobby ---
@@ -456,7 +464,7 @@ func _back_to_lobby() -> void:
 
 
 func _update_auto_start() -> void:
-	if is_public and phase == "lobby" and players.size() >= MIN_PLAYERS:
+	if auto_start and phase == "lobby" and players.size() >= MIN_PLAYERS:
 		if auto_start_at == 0:
 			auto_start_at = now_ms() + AUTO_START_MS
 	else:
