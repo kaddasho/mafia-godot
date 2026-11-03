@@ -1,0 +1,8 @@
+# Render Blueprint: deploys the game server (server/ folder) as a free Docker web service.
+services:
+  - type: web
+    name: mafia-server
+    runtime: docker
+    plan: free
+    dockerContext: ./server
+    dockerfilePath: ./server/Dockerfile
