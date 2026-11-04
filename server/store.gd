@@ -166,8 +166,9 @@ func _rest(method: int, path: String, body: Variant = null, extra: Array = []) -
 	var http := HTTPRequest.new()
 	http.timeout = 15.0
 	add_child(http)
-	var headers := PackedStringArray([
-		"apikey: " + _key, "Authorization: Bearer " + _key, "Content-Type: application/json"])
+	var headers := PackedStringArray(["apikey: " + _key, "Content-Type: application/json"])
+	if _key.begins_with("eyJ"):  # legacy service_role JWT; new sb_secret_ keys go in apikey only
+		headers.append("Authorization: Bearer " + _key)
 	if extra.is_empty():
 		headers.append("Prefer: return=representation")
 	for h: String in extra:
