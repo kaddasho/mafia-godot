@@ -4,6 +4,8 @@ extends Node
 ## Online it runs from the Dockerfile in this folder; the host's PORT variable picks the port.
 
 const Room := preload("res://room.gd")
+const Store := preload("res://store.gd")
+const Social := preload("res://social.gd")
 const CODE_CHARS := "ABCDEFGHJKLMNPQRSTUVWXYZ"
 const MAX_VOICE_BYTES := 4096
 const DEFAULT_NAMES := {"ar": "لاعب", "ru": "Игрок", "en": "Player", "tr": "Oyuncu", "de": "Spieler"}
@@ -15,9 +17,11 @@ class Client:
 	var ws: WebSocketPeer
 	var room_code: String = ""
 	var welcomed: bool = false
+	var account: String = ""  # permanent account id once signed in ("auth")
 
 
 var _tcp := TCPServer.new()
+var _social: Social
 var _crypto := Crypto.new()
 var _clients: Dictionary = {}  # id -> Client
 var _rooms: Dictionary = {}  # code -> Room
@@ -33,6 +37,12 @@ func _ready() -> void:
 			port = int(arg.get_slice("=", 1))
 		elif arg.begins_with("--grace="):
 			Room.grace_ms = int(arg.get_slice("=", 1))
+	var store := Store.new()
+	add_child(store)
+	_social = Social.new()
+	_social.store = store
+	_social.server = self
+	add_child(_social)
 	if _tcp.listen(port) != OK:
 		push_error("Can't listen on port %d" % port)
 		get_tree().quit(1)
@@ -64,6 +74,7 @@ func _process(_delta: float) -> void:
 						_relay_voice(c, pkt)
 			WebSocketPeer.STATE_CLOSED:
 				_clients.erase(c.id)
+				_social.signed_out(c)
 				var room: Room = _rooms.get(c.room_code)
 				if room != null:
 					room.disconnect_player(c.id)
@@ -94,6 +105,9 @@ func _handle(c: Client, text: String) -> void:
 	if typeof(parsed) != TYPE_DICTIONARY:
 		return
 	var m: Dictionary = parsed
+	if _social.handles(str(m.get("t", ""))):
+		_social.handle(c, m)
+		return
 	var room: Room = _rooms.get(c.room_code)
 	var err := ""
 	match str(m.get("t", "")):
@@ -199,6 +213,9 @@ func _resume(c: Client, token: String) -> void:
 	c.id = old.id
 	c.token = old.token
 	c.room_code = old.room_code
+	if c.account == "" and old.account != "":
+		c.account = old.account
+		_social.online[old.account] = c
 	_clients[c.id] = c
 	_send(c.id, {"t": "welcome", "id": c.id, "token": c.token, "resumed": true})
 	room.reconnect_player(c.id)
@@ -223,9 +240,10 @@ func _enter_room(c: Client, room: Room, player_name: String, m: Dictionary) -> S
 	var country := str(m.get("country", "")).strip_edges().to_lower()
 	if country.length() != 2 or not country.is_valid_identifier():
 		country = ""
-	var err := room.add_player(c.id, player_name, gender, country)
+	var err := room.add_player(c.id, player_name, gender, country, c.account)
 	if err == "":
 		c.room_code = room.code
+		_social.room_changed(c)
 	elif room.is_empty():
 		_rooms.erase(room.code)
 	return err
@@ -236,6 +254,7 @@ func _leave(c: Client, notify: bool) -> void:
 		return
 	var room: Room = _rooms.get(c.room_code)
 	c.room_code = ""
+	_social.room_changed(c)
 	if room != null:
 		room.remove_player(c.id)
 		if room.is_empty():

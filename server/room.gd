@@ -97,12 +97,12 @@ func summary() -> Dictionary:
 
 # --- lobby ---
 
-func add_player(id: String, player_name: String, gender: String = "", country: String = "") -> String:
+func add_player(id: String, player_name: String, gender: String = "", country: String = "", account: String = "") -> String:
 	if phase != "lobby":
 		return "room_in_progress"
 	if players.size() >= max_players:
 		return "room_full"
-	players.append({"id": id, "name": player_name, "gender": gender, "country": country,
+	players.append({"id": id, "name": player_name, "gender": gender, "country": country, "account": account,
 		"ready": false, "connected": true, "alive": true, "role": "", "gone": false, "drop_at": 0})
 	if host_id == "":
 		host_id = id
@@ -641,6 +641,7 @@ func view_for(me: Dictionary) -> Dictionary:
 			"name": p.name,
 			"gender": p.gender,
 			"country": p.country,
+			"account": p.account,  # public account id, so players can add each other as friends
 			"ready": p.ready,
 			"host": p.id == host_id,
 			"connected": p.connected,
