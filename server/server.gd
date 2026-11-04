@@ -99,15 +99,17 @@ func _handle(c: Client, text: String) -> void:
 	match str(m.get("t", "")):
 		"create":
 			_leave(c, false)
-			var max_count := clampi(int(m.get("maxPlayers", 8)), Room.MIN_PLAYERS, 12)
+			var max_count := clampi(int(m.get("maxPlayers", Room.MAX_PLAYERS)), Room.MIN_PLAYERS, Room.MAX_PLAYERS)
 			var player_name := _clean_name(m)
 			var created := _new_room(player_name, bool(m.get("isPublic", false)), max_count)
 			created.lang = str(m.get("lang", ""))
-			err = _enter_room(c, created, player_name)
+			created.pace = str(m.get("pace", "medium")) if Room.PACES.has(str(m.get("pace", ""))) else "medium"
+			created.open_talk = bool(m.get("openTalk", false))
+			err = _enter_room(c, created, player_name, m)
 		"join":
 			_leave(c, false)
 			var target: Room = _rooms.get(str(m.get("code", "")).strip_edges().to_upper())
-			err = "room_not_found" if target == null else _enter_room(c, target, _clean_name(m))
+			err = "room_not_found" if target == null else _enter_room(c, target, _clean_name(m), m)
 		"quick":
 			_leave(c, false)
 			var player_name := _clean_name(m)
@@ -117,10 +119,10 @@ func _handle(c: Client, text: String) -> void:
 					target = r
 					break
 			if target == null:
-				target = _new_room(player_name, true, 8)
+				target = _new_room(player_name, true, 12)
 				target.lang = str(m.get("lang", ""))
 				target.auto_start = true  # quick-play rooms start themselves; hosted rooms wait for the host
-			err = _enter_room(c, target, player_name)
+			err = _enter_room(c, target, player_name, m)
 		"list":
 			var listed := []
 			for r: Room in _rooms.values():
@@ -143,6 +145,14 @@ func _handle(c: Client, text: String) -> void:
 				err = room.set_pace(c.id, str(m.pace))
 			elif m.has("mafia"):
 				err = room.set_mafia(c.id, int(m.mafia))
+			elif m.has("openTalk"):
+				err = room.set_open_talk(c.id, bool(m.openTalk))
+			elif m.has("maxPlayers"):
+				err = room.set_max_players(c.id, int(m.maxPlayers))
+		"turn":
+			err = "not_in_room" if room == null else room.turn(c.id, str(m.get("action", "")), str(m.get("target", "")))
+		"react":
+			err = "not_in_room" if room == null else room.react(c.id, int(m.get("e", -1)))
 		"act":
 			err = "not_in_room" if room == null else room.act(c.id, str(m.get("target", "")))
 		"skip":
@@ -205,8 +215,15 @@ func _new_room(room_name: String, public: bool, max_count: int) -> Room:
 	return room
 
 
-func _enter_room(c: Client, room: Room, player_name: String) -> String:
-	var err := room.add_player(c.id, player_name)
+## Joins `room` with the profile sent in the message: gender "m"/"f", country as a 2-letter code.
+func _enter_room(c: Client, room: Room, player_name: String, m: Dictionary) -> String:
+	var gender := str(m.get("gender", ""))
+	if gender not in ["m", "f"]:
+		gender = ""
+	var country := str(m.get("country", "")).strip_edges().to_lower()
+	if country.length() != 2 or not country.is_valid_identifier():
+		country = ""
+	var err := room.add_player(c.id, player_name, gender, country)
 	if err == "":
 		c.room_code = room.code
 	elif room.is_empty():

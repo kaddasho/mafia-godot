@@ -1,18 +1,24 @@
 extends RefCounted
-## One room: its players, the lobby and the game itself (roles -> night -> day -> vote -> ...).
+## One room: its players, the lobby and the game itself
+## (roles -> night -> day with speaking turns -> secret vote -> result -> night ...).
 ## Every change is pushed with broadcast(); each player gets their own view (hidden roles stay hidden).
 
 const MIN_PLAYERS := 4
+const MAX_PLAYERS := 15
 const AUTO_START_MS := 15000
-const ROLES_MS := 6000
+const ROLES_MS := 7000
+const RESULT_MS := 7000
 const ENDED_MS := 20000
-## Phase lengths (ms) the host picks in the lobby.
+const REACTIONS := 7  # emoji 0..6, drawn by the client
+const REACT_GAP_MS := 400  # per player, to stop spam
+## Phase lengths (ms) the host picks in the lobby; "turn" is each speaker's time in the discussion.
 const PACES := {
-	"short": {"night": 30000, "day": 60000, "vote": 30000},
-	"medium": {"night": 45000, "day": 180000, "vote": 45000},
-	"long": {"night": 60000, "day": 300000, "vote": 60000},
+	"short": {"night": 30000, "day": 60000, "vote": 30000, "turn": 20000},
+	"medium": {"night": 45000, "day": 180000, "vote": 45000, "turn": 30000},
+	"long": {"night": 60000, "day": 300000, "vote": 60000, "turn": 45000},
 }
 const NIGHT_ROLES: Array[String] = ["mafia", "doctor", "detective"]
+const TALK_PHASES: Array[String] = ["night", "day", "vote", "result"]
 
 ## How long a disconnected player keeps their seat before they count as having left.
 static var grace_ms: int = 60000
@@ -26,13 +32,20 @@ var lang: String = ""  # creator's language, shown in the public room list
 var auto_start: bool = false  # quick-play rooms start on their own once enough players are in
 var pace: String = "medium"
 var mafia_count: int = 0  # 0 = automatic
+var open_talk: bool = false  # discussion without a time limit; the host moves it on to the vote
 var phase: String = "lobby"
 var deadline: int = 0
 var auto_start_at: int = 0
 var round_no: int = 0
 var host_id: String = ""
-## {id, name, ready, connected, alive, role, gone, drop_at}
+## {id, name, gender, country, ready, connected, alive, role, gone, drop_at}
 var players: Array[Dictionary] = []
+
+## Speaking turns in the discussion: everyone may talk, the turn just says whose floor it is.
+var turn_order: Array[String] = []
+var turn_idx: int = -1  # -1 = no current speaker (open floor after the last turn)
+var turn_deadline: int = 0
+var _last_react: Dictionary = {}  # player id -> ms
 
 var night_actions: Dictionary = {}  # actor id -> target id
 var day_skips: Dictionary = {}  # player id -> true
@@ -79,17 +92,18 @@ func is_open() -> bool:
 ## One line of the public room list.
 func summary() -> Dictionary:
 	return {"code": code, "name": name, "players": players.size(), "max": max_players,
-		"lang": lang, "pace": pace, "mafia": mafia_count}
+		"lang": lang, "pace": pace, "mafia": mafia_count, "openTalk": open_talk}
 
 
 # --- lobby ---
 
-func add_player(id: String, player_name: String) -> String:
+func add_player(id: String, player_name: String, gender: String = "", country: String = "") -> String:
 	if phase != "lobby":
 		return "room_in_progress"
 	if players.size() >= max_players:
 		return "room_full"
-	players.append({"id": id, "name": player_name, "ready": false, "connected": true, "alive": true, "role": "", "gone": false, "drop_at": 0})
+	players.append({"id": id, "name": player_name, "gender": gender, "country": country,
+		"ready": false, "connected": true, "alive": true, "role": "", "gone": false, "drop_at": 0})
 	if host_id == "":
 		host_id = id
 	_update_auto_start()
@@ -117,6 +131,9 @@ func remove_player(id: String) -> void:
 	if phase == "lobby":
 		_update_auto_start()
 	elif phase != "ended" and (_check_win() or _maybe_advance_early()):
+		return
+	elif phase == "day" and current_speaker() == id:
+		_next_turn()
 		return
 	broadcast()
 
@@ -146,10 +163,9 @@ func reconnect_player(id: String) -> bool:
 
 
 func set_pace(by: String, value: String) -> String:
-	if phase != "lobby":
-		return "room_in_progress"
-	if by != host_id:
-		return "not_host"
+	var err := _host_lobby(by)
+	if err != "":
+		return err
 	if not PACES.has(value):
 		return "bad_value"
 	pace = value
@@ -157,22 +173,65 @@ func set_pace(by: String, value: String) -> String:
 	return ""
 
 
-## Host's mafia count: 0 = automatic, 1..3 = fixed (capped by max_mafia() when the game starts).
+## Host's mafia count: 0 = automatic, 1..4 = fixed (capped by max_mafia() when the game starts).
 func set_mafia(by: String, value: int) -> String:
-	if phase != "lobby":
-		return "room_in_progress"
-	if by != host_id:
-		return "not_host"
-	if value < 0 or value > 3:
+	var err := _host_lobby(by)
+	if err != "":
+		return err
+	if value < 0 or value > 4:
 		return "bad_value"
 	mafia_count = value
 	broadcast()
 	return ""
 
 
+func set_open_talk(by: String, value: bool) -> String:
+	var err := _host_lobby(by)
+	if err != "":
+		return err
+	open_talk = value
+	broadcast()
+	return ""
+
+
+## Room size 4..15; never below the players already inside.
+func set_max_players(by: String, value: int) -> String:
+	var err := _host_lobby(by)
+	if err != "":
+		return err
+	if value < maxi(MIN_PLAYERS, players.size()) or value > MAX_PLAYERS:
+		return "bad_value"
+	max_players = value
+	broadcast()
+	return ""
+
+
+func _host_lobby(by: String) -> String:
+	if phase != "lobby":
+		return "room_in_progress"
+	if by != host_id:
+		return "not_host"
+	return ""
+
+
 ## Mafia must start as a clear minority, otherwise they win at once.
 static func max_mafia(n: int) -> int:
-	return maxi(1, mini(3, (n - 1) / 2))
+	return maxi(1, mini(4, (n - 1) / 2))
+
+
+## Emoji reaction, sent to everyone in the room; doesn't touch the game state.
+func react(id: String, emoji: int) -> String:
+	var p := find(id)
+	if p.is_empty() or emoji < 0 or emoji >= REACTIONS:
+		return "bad_value"
+	var now := now_ms()
+	if now - int(_last_react.get(id, 0)) < REACT_GAP_MS:
+		return ""  # too fast: silently dropped
+	_last_react[id] = now
+	for q in players:
+		if q.connected:
+			_send.call(q.id, {"t": "react", "from": id, "e": emoji})
+	return ""
 
 
 func _ms(phase_name: String) -> int:
@@ -186,7 +245,7 @@ func voice_targets(speaker_id: String) -> Array[String]:
 	var s := find(speaker_id)
 	if s.is_empty():
 		return out
-	var in_game := phase in ["night", "day", "vote"]
+	var in_game := TALK_PHASES.has(phase)
 	if in_game and not s.alive:
 		return out
 	if phase == "night" and s.role != "mafia":
@@ -253,6 +312,63 @@ func skip(id: String) -> String:
 	return ""
 
 
+func current_speaker() -> String:
+	return turn_order[turn_idx] if turn_idx >= 0 and turn_idx < turn_order.size() else ""
+
+
+## Discussion turns. The speaker can "pass"; the host can go "next" / "prev", "select" anyone alive,
+## or "vote" to end the discussion.
+func turn(by: String, action: String, target: String = "") -> String:
+	if phase != "day":
+		return "wrong_phase"
+	match action:
+		"pass":
+			if by != current_speaker():
+				return "not_allowed"
+			_next_turn()
+		"next", "prev", "select", "vote":
+			if by != host_id:
+				return "not_host"
+			match action:
+				"next":
+					_next_turn()
+				"prev":
+					_set_turn(maxi(0, turn_idx - 1), -1)
+				"select":
+					var i := turn_order.find(target)
+					var t := find(target)
+					if i < 0 or t.is_empty() or not t.alive:
+						return "bad_target"
+					_set_turn(i, 1)
+				"vote":
+					_enter("vote", _ms("vote"))
+		_:
+			return "bad_value"
+	return ""
+
+
+func _next_turn() -> void:
+	_set_turn(turn_idx + 1, 1)
+
+
+## Moves the floor to index `i`, stepping in direction `dir` past anyone dead or offline.
+## Past the last speaker: open floor if the discussion is unlimited, otherwise on to the vote.
+func _set_turn(i: int, dir: int) -> void:
+	while i >= 0 and i < turn_order.size():
+		var p := find(turn_order[i])
+		if not p.is_empty() and p.alive and p.connected:
+			break
+		i += dir
+	if i < 0 or i >= turn_order.size():
+		if not open_talk and dir > 0:
+			_enter("vote", _ms("vote"))
+			return
+		i = -1 if dir > 0 else turn_idx
+	turn_idx = i
+	turn_deadline = now_ms() + _ms("turn") if turn_idx >= 0 and not open_talk else 0
+	broadcast()
+
+
 ## target "" means "skip the vote".
 func vote(id: String, target: String) -> String:
 	if phase != "vote":
@@ -284,6 +400,8 @@ func tick(now: int) -> void:
 		return
 	if deadline > 0 and now >= deadline:
 		_advance()
+	elif phase == "day" and turn_deadline > 0 and now >= turn_deadline:
+		_next_turn()
 
 
 # --- game flow ---
@@ -304,7 +422,7 @@ func _begin_game() -> void:
 
 
 func _role_list(n: int) -> Array[String]:
-	var mafia := 1 if n < 6 else (2 if n < 9 else 3)
+	var mafia := 1 if n < 6 else (2 if n < 9 else (3 if n < 13 else 4))
 	if mafia_count > 0:
 		mafia = mini(mafia_count, max_mafia(n))
 	var roles: Array[String] = []
@@ -320,14 +438,29 @@ func _role_list(n: int) -> Array[String]:
 func _enter(new_phase: String, ms: int) -> void:
 	phase = new_phase
 	deadline = now_ms() + ms if ms > 0 else 0
+	turn_deadline = 0
 	match phase:
 		"night":
 			round_no += 1
 			night_actions.clear()
 		"day":
 			day_skips.clear()
+			if open_talk:
+				deadline = 0
+			# living players speak in seat order, starting one seat later each round
+			var living: Array[String] = []
+			for p in players:
+				if p.alive:
+					living.append(p.id)
+			turn_order.clear()
+			for k in living.size():
+				turn_order.append(living[(k + round_no - 1) % living.size()])
+			turn_idx = -1
+			_set_turn(0, 1)
+			return  # _set_turn broadcasts
 		"vote":
 			votes.clear()
+			turn_idx = -1
 	broadcast()
 
 
@@ -341,6 +474,8 @@ func _advance() -> void:
 			_enter("vote", _ms("vote"))
 		"vote":
 			_resolve_vote()
+		"result":
+			_enter("night", _ms("night"))
 		"ended":
 			_back_to_lobby()
 
@@ -411,9 +546,11 @@ func _resolve_vote() -> void:
 	if top.size() == 1 and top[0] != "":
 		out = top[0]
 		find(out).alive = false
-	last_vote = {"round": round_no, "out": out, "votes": votes.duplicate()}
+	tally.erase("")
+	last_vote = {"round": round_no, "out": out, "votes": votes.duplicate(), "tally": tally,
+		"abstained": votes.values().count("")}
 	if not _check_win():
-		_enter("night", _ms("night"))
+		_enter("result", RESULT_MS)
 
 
 func _most_voted(tally: Dictionary) -> Array:
@@ -502,6 +639,8 @@ func view_for(me: Dictionary) -> Dictionary:
 		list.append({
 			"id": p.id,
 			"name": p.name,
+			"gender": p.gender,
+			"country": p.country,
 			"ready": p.ready,
 			"host": p.id == host_id,
 			"connected": p.connected,
@@ -533,6 +672,7 @@ func view_for(me: Dictionary) -> Dictionary:
 		"pace": pace,
 		"mafia": mafia_count,
 		"mafiaMax": max_mafia(players.size()),
+		"openTalk": open_talk,
 		"max": max_players,
 		"phase": phase,
 		"round": round_no,
@@ -547,6 +687,14 @@ func view_for(me: Dictionary) -> Dictionary:
 	}
 	if phase == "day":
 		d["skips"] = day_skips.keys()
+		d["turn"] = {"speaker": current_speaker(), "idx": turn_idx, "total": turn_order.size(),
+			"deadline": turn_deadline, "order": turn_order}
 	if phase == "vote":
-		d["votes"] = votes
+		# votes stay secret until the result: only progress is shared
+		var alive := 0
+		for p in players:
+			if p.alive:
+				alive += 1
+		d["voted"] = votes.size()
+		d["voters"] = alive
 	return d
