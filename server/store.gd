@@ -15,9 +15,14 @@ var _next_message_id: int = 1
 
 
 func _ready() -> void:
-	_url = OS.get_environment("SUPABASE_URL").strip_edges().trim_suffix("/")
-	_key = OS.get_environment("SUPABASE_KEY").strip_edges()
+	# Keys pasted into a dashboard sometimes pick up line breaks or spaces; none are valid inside a URL or key.
+	_url = _no_spaces(OS.get_environment("SUPABASE_URL")).trim_suffix("/")
+	_key = _no_spaces(OS.get_environment("SUPABASE_KEY"))
 	print("storage: ", "Supabase" if persistent() else "memory (set SUPABASE_URL / SUPABASE_KEY to keep data)")
+
+
+static func _no_spaces(s: String) -> String:
+	return "".join(s.split(" ", false)).replace("\n", "").replace("\r", "").replace("\t", "")
 
 
 func persistent() -> bool:
