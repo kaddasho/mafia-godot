@@ -12,6 +12,9 @@ var _players: Dictionary = {}  # id -> player
 var _friendships: Dictionary = {}  # "a|b" -> {a, b, status, requester}
 var _messages: Array = []
 var _next_message_id: int = 1
+var _blocks: Dictionary = {}  # "blocker>blocked" -> true
+var _reports: Array = []
+var _files: Dictionary = {}  # storage path -> bytes
 
 
 func _ready() -> void:
@@ -59,7 +62,7 @@ func get_players(ids: Array) -> Array:
 		return []
 	if not persistent():
 		return ids.filter(func(i: String) -> bool: return _players.has(i)).map(func(i: String) -> Dictionary: return _players[i])
-	return await _rest(HTTPClient.METHOD_GET, "players?id=in.(%s)&select=id,name,gender,country,tag" % ",".join(ids))
+	return await _rest(HTTPClient.METHOD_GET, "players?id=in.(%s)&select=id,name,gender,country,tag,photo" % ",".join(ids))
 
 
 ## By name (part of it) or by exact "name#1234".
@@ -77,7 +80,7 @@ func search_players(q: String) -> Array:
 				out.append(p)
 		return out.slice(0, 20)
 	var filter := "name=eq.%s&tag=eq.%d" % [name.uri_encode(), tag] if tag >= 0 else "name=ilike.*%s*" % name.uri_encode()
-	return await _rest(HTTPClient.METHOD_GET, "players?%s&select=id,name,gender,country,tag&limit=20" % filter)
+	return await _rest(HTTPClient.METHOD_GET, "players?%s&select=id,name,gender,country,tag,photo&limit=20" % filter)
 
 
 # --- friendships (stored once per pair, a < b) ---
@@ -119,8 +122,10 @@ func delete_friendship(x: String, y: String) -> void:
 
 # --- messages ---
 
-func add_message(sender: String, receiver: String, body: String) -> Dictionary:
+func add_message(sender: String, receiver: String, body: String, image: String = "") -> Dictionary:
 	var row := {"sender": sender, "receiver": receiver, "body": body}
+	if image != "":
+		row["image"] = image
 	if not persistent():
 		row.merge({"id": _next_message_id, "read": false, "created_at": Time.get_datetime_string_from_system(true) + "Z"})
 		_next_message_id += 1
@@ -130,14 +135,14 @@ func add_message(sender: String, receiver: String, body: String) -> Dictionary:
 	return rows[0] if not rows.is_empty() else row
 
 
-## The latest `limit` messages between two players, oldest first.
-func get_messages(x: String, y: String, limit: int = 50) -> Array:
+## The latest `limit` messages between two players (older than id `before` when given), oldest first.
+func get_messages(x: String, y: String, limit: int = 50, before: int = 0) -> Array:
 	if not persistent():
 		var both := _messages.filter(func(m: Dictionary) -> bool:
-			return (m.sender == x and m.receiver == y) or (m.sender == y and m.receiver == x))
+			return ((m.sender == x and m.receiver == y) or (m.sender == y and m.receiver == x)) and (before <= 0 or int(m.id) < before))
 		return both.slice(maxi(0, both.size() - limit))
 	var rows: Array = await _rest(HTTPClient.METHOD_GET,
-		"messages?or=(and(sender.eq.%s,receiver.eq.%s),and(sender.eq.%s,receiver.eq.%s))&order=id.desc&limit=%d" % [x, y, y, x, limit])
+		"messages?or=(and(sender.eq.%s,receiver.eq.%s),and(sender.eq.%s,receiver.eq.%s))%s&order=id.desc&limit=%d" % [x, y, y, x, "&id=lt.%d" % before if before > 0 else "", limit])
 	rows.reverse()
 	return rows
 
@@ -162,6 +167,110 @@ func unread_counts(me: String) -> Dictionary:
 	for m: Dictionary in rows:
 		out[m.sender] = int(out.get(m.sender, 0)) + 1
 	return out
+
+
+func get_message(id: int) -> Dictionary:
+	if not persistent():
+		for m: Dictionary in _messages:
+			if int(m.id) == id:
+				return m
+		return {}
+	var rows: Array = await _rest(HTTPClient.METHOD_GET, "messages?id=eq.%d&select=*" % id)
+	return rows[0] if not rows.is_empty() else {}
+
+
+# --- blocking and reports ---
+
+## True if either player blocked the other.
+func is_blocked(x: String, y: String) -> bool:
+	if not persistent():
+		return _blocks.has(x + ">" + y) or _blocks.has(y + ">" + x)
+	var rows: Array = await _rest(HTTPClient.METHOD_GET,
+		"blocks?or=(and(blocker.eq.%s,blocked.eq.%s),and(blocker.eq.%s,blocked.eq.%s))&select=blocker" % [x, y, y, x])
+	return not rows.is_empty()
+
+
+func set_block(blocker: String, blocked: String, on: bool) -> void:
+	if not persistent():
+		if on:
+			_blocks[blocker + ">" + blocked] = true
+		else:
+			_blocks.erase(blocker + ">" + blocked)
+		return
+	if on:
+		await _rest(HTTPClient.METHOD_POST, "blocks?on_conflict=blocker,blocked", {"blocker": blocker, "blocked": blocked},
+			["Prefer: resolution=ignore-duplicates,return=minimal"])
+	else:
+		await _rest(HTTPClient.METHOD_DELETE, "blocks?blocker=eq.%s&blocked=eq.%s" % [blocker, blocked])
+
+
+## Players `me` has blocked.
+func blocked_by(me: String) -> Array:
+	if not persistent():
+		var out := []
+		for k: String in _blocks:
+			if k.begins_with(me + ">"):
+				out.append(k.get_slice(">", 1))
+		return out
+	var rows: Array = await _rest(HTTPClient.METHOD_GET, "blocks?blocker=eq.%s&select=blocked" % me)
+	return rows.map(func(r: Dictionary) -> String: return str(r.blocked))
+
+
+func add_report(reporter: String, target: String, reason: String) -> void:
+	if not persistent():
+		_reports.append({"reporter": reporter, "target": target, "reason": reason})
+		return
+	await _rest(HTTPClient.METHOD_POST, "reports", {"reporter": reporter, "target": target, "reason": reason}, ["Prefer: return=minimal"])
+
+
+# --- files (profile photos, chat images) in the private Supabase Storage bucket ---
+
+const BUCKET := "media"
+
+
+func put_file(path: String, data: PackedByteArray, mime: String = "image/jpeg") -> bool:
+	if not persistent():
+		_files[path] = data
+		return true
+	var res := await _raw(HTTPClient.METHOD_POST, "/storage/v1/object/%s/%s" % [BUCKET, path], data,
+		["Content-Type: " + mime, "x-upsert: true"])
+	return res[0] >= 200 and res[0] < 300
+
+
+func get_file(path: String) -> PackedByteArray:
+	if not persistent():
+		return _files.get(path, PackedByteArray())
+	var res := await _raw(HTTPClient.METHOD_GET, "/storage/v1/object/%s/%s" % [BUCKET, path])
+	return res[1] if res[0] == 200 else PackedByteArray()
+
+
+func delete_file(path: String) -> void:
+	if not persistent():
+		_files.erase(path)
+		return
+	await _raw(HTTPClient.METHOD_DELETE, "/storage/v1/object/%s/%s" % [BUCKET, path])
+
+
+## Binary request to Supabase (storage); returns [status code, body bytes].
+func _raw(method: int, path: String, body: PackedByteArray = PackedByteArray(), extra: Array = []) -> Array:
+	var http := HTTPRequest.new()
+	http.timeout = 30.0
+	http.body_size_limit = 2 * 1024 * 1024
+	add_child(http)
+	var headers := PackedStringArray(["apikey: " + _key])
+	if _key.begins_with("eyJ"):
+		headers.append("Authorization: Bearer " + _key)
+	for h: String in extra:
+		headers.append(h)
+	var err := http.request_raw(_url + path, headers, method, body)
+	if err != OK:
+		http.queue_free()
+		return [0, PackedByteArray()]
+	var res: Array = await http.request_completed
+	http.queue_free()
+	if res[1] < 200 or res[1] >= 300:
+		push_error("storage file %s -> %d %s" % [path, res[1], (res[3] as PackedByteArray).get_string_from_utf8().left(200)])
+	return [res[1], res[3]]
 
 
 # --- Supabase REST ---

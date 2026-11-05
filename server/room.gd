@@ -100,12 +100,12 @@ func summary() -> Dictionary:
 
 # --- lobby ---
 
-func add_player(id: String, player_name: String, gender: String = "", country: String = "", account: String = "", avatar: int = 0) -> String:
+func add_player(id: String, player_name: String, gender: String = "", country: String = "", account: String = "", avatar: int = 0, photo: String = "") -> String:
 	if phase != "lobby":
 		return "room_in_progress"
 	if players.size() >= max_players:
 		return "room_full"
-	players.append({"id": id, "name": player_name, "gender": gender, "country": country, "account": account, "avatar": avatar,
+	players.append({"id": id, "name": player_name, "gender": gender, "country": country, "account": account, "avatar": avatar, "photo": photo,
 		"ready": false, "connected": true, "alive": true, "role": "", "gone": false, "drop_at": 0})
 	if host_id == "":
 		host_id = id
@@ -258,6 +258,15 @@ func chat(id: String, text: String) -> String:
 	for t in targets:
 		_send.call(t, line)
 	return ""
+
+
+## A player changed their profile photo: the room shows the new one.
+func set_photo(account: String, ver: String) -> void:
+	for p in players:
+		if p.account == account and p.get("photo", "") != ver:
+			p["photo"] = ver
+			broadcast()
+			return
 
 
 ## The player's own mute switch, shown to the others as a small red badge.
@@ -677,6 +686,7 @@ func view_for(me: Dictionary) -> Dictionary:
 			"gender": p.gender,
 			"country": p.country,
 			"avatar": p.get("avatar", 0),  # chosen portrait 1..15, 0 = none
+			"photo": p.get("photo", ""),  # version of the uploaded profile photo, "" = none
 			"account": p.account,  # public account id, so players can add each other as friends
 			"ready": p.ready,
 			"host": p.id == host_id,

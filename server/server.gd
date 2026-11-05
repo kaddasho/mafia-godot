@@ -18,6 +18,7 @@ class Client:
 	var room_code: String = ""
 	var welcomed: bool = false
 	var account: String = ""  # permanent account id once signed in ("auth")
+	var photo: String = ""  # version of the account's profile photo ("" = none)
 
 
 var _tcp := TCPServer.new()
@@ -56,6 +57,9 @@ func _process(_delta: float) -> void:
 		c.id = _crypto.generate_random_bytes(4).hex_encode()
 		c.token = _crypto.generate_random_bytes(16).hex_encode()
 		c.ws = WebSocketPeer.new()
+		# room for chat images and profile photos (sent as base64 text)
+		c.ws.inbound_buffer_size = 1 << 20
+		c.ws.outbound_buffer_size = 1 << 21
 		c.ws.accept_stream(_tcp.take_connection())
 		_clients[c.id] = c
 
@@ -220,6 +224,7 @@ func _resume(c: Client, token: String) -> void:
 	c.room_code = old.room_code
 	if c.account == "" and old.account != "":
 		c.account = old.account
+		c.photo = old.photo
 		_social.online[old.account] = c
 	_clients[c.id] = c
 	_send(c.id, {"t": "welcome", "id": c.id, "token": c.token, "resumed": true})
@@ -238,6 +243,13 @@ func _new_room(room_name: String, public: bool, max_count: int) -> Room:
 
 
 ## Joins `room` with the profile sent in the message: gender "m"/"f", country as a 2-letter code.
+## Called by Social when a player changes their profile photo while in a room.
+func photo_changed(c: Client) -> void:
+	var room: Room = _rooms.get(c.room_code)
+	if room != null:
+		room.set_photo(c.account, c.photo)
+
+
 func _enter_room(c: Client, room: Room, player_name: String, m: Dictionary) -> String:
 	var gender := str(m.get("gender", ""))
 	if gender not in ["m", "f"]:
@@ -246,7 +258,7 @@ func _enter_room(c: Client, room: Room, player_name: String, m: Dictionary) -> S
 	if country.length() != 2 or not country.is_valid_identifier():
 		country = ""
 	var avatar := clampi(int(m.get("avatar", 0)), 0, 15)
-	var err := room.add_player(c.id, player_name, gender, country, c.account, avatar)
+	var err := room.add_player(c.id, player_name, gender, country, c.account, avatar, c.photo)
 	if err == "":
 		c.room_code = room.code
 		_social.room_changed(c)
