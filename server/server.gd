@@ -19,6 +19,9 @@ class Client:
 	var welcomed: bool = false
 	var account: String = ""  # permanent account id once signed in ("auth")
 	var photo: String = ""  # version of the account's profile photo ("" = none)
+	var show_online: bool = true  # privacy: friends see this player as online (false = appear offline)
+	var allow_join: bool = true  # privacy: friends may join this player's room without asking
+	var profile: Dictionary = {}  # name / gender / country / avatar from the last sign-in
 
 
 var _tcp := TCPServer.new()
@@ -225,6 +228,9 @@ func _resume(c: Client, token: String) -> void:
 	if c.account == "" and old.account != "":
 		c.account = old.account
 		c.photo = old.photo
+		c.profile = old.profile
+		c.show_online = old.show_online
+		c.allow_join = old.allow_join
 		_social.online[old.account] = c
 	_clients[c.id] = c
 	_send(c.id, {"t": "welcome", "id": c.id, "token": c.token, "resumed": true})
@@ -262,9 +268,28 @@ func _enter_room(c: Client, room: Room, player_name: String, m: Dictionary) -> S
 	if err == "":
 		c.room_code = room.code
 		_social.room_changed(c)
+		_social.block_alert(c, room)
 	elif room.is_empty():
 		_rooms.erase(room.code)
 	return err
+
+
+## Social puts a player into a room (join a friend, after any approvals); same checks as "join".
+func join_room(c: Client, room: Room) -> void:
+	if c.room_code == room.code:
+		return
+	_leave(c, false)
+	var err := _enter_room(c, room, _clean_name(c.profile), c.profile)
+	if err != "":
+		_send(c.id, {"t": "error", "code": err})
+
+
+func room_of(c: Client) -> Room:
+	return _rooms.get(c.room_code)
+
+
+func client(id: String) -> Client:
+	return _clients.get(id)
 
 
 func _leave(c: Client, notify: bool) -> void:

@@ -204,6 +204,18 @@ func set_block(blocker: String, blocked: String, on: bool) -> void:
 		await _rest(HTTPClient.METHOD_DELETE, "blocks?blocker=eq.%s&blocked=eq.%s" % [blocker, blocked])
 
 
+## Players who blocked `me`.
+func blockers_of(me: String) -> Array:
+	if not persistent():
+		var out := []
+		for k: String in _blocks:
+			if k.ends_with(">" + me):
+				out.append(k.get_slice(">", 0))
+		return out
+	var rows: Array = await _rest(HTTPClient.METHOD_GET, "blocks?blocked=eq.%s&select=blocker" % me)
+	return rows.map(func(r: Dictionary) -> String: return str(r.blocker))
+
+
 ## Players `me` has blocked.
 func blocked_by(me: String) -> Array:
 	if not persistent():
@@ -216,11 +228,104 @@ func blocked_by(me: String) -> Array:
 	return rows.map(func(r: Dictionary) -> String: return str(r.blocked))
 
 
-func add_report(reporter: String, target: String, reason: String) -> void:
+## A report about a player, or about one message / image of theirs (message_id > 0). The moderator
+## reviews these in Supabase (table "reports", newest open ones first).
+func add_report(reporter: String, target: String, reason: String, message_id: int = 0, image: String = "") -> void:
+	var row := {"reporter": reporter, "target": target, "reason": reason}
+	if message_id > 0:
+		row["message_id"] = message_id
+		row["kind"] = "image" if image != "" else "message"
+		if image != "":
+			row["image"] = image
 	if not persistent():
-		_reports.append({"reporter": reporter, "target": target, "reason": reason})
+		_reports.append(row)
 		return
-	await _rest(HTTPClient.METHOD_POST, "reports", {"reporter": reporter, "target": target, "reason": reason}, ["Prefer: return=minimal"])
+	await _rest(HTTPClient.METHOD_POST, "reports", row, ["Prefer: return=minimal"])
+
+
+## Reported message: hidden from both people until a moderator looks at it.
+func hide_message(id: int) -> void:
+	if not persistent():
+		for m: Dictionary in _messages:
+			if int(m.id) == id:
+				m.hidden = true
+		return
+	await _rest(HTTPClient.METHOD_PATCH, "messages?id=eq.%d" % id, {"hidden": true}, ["Prefer: return=minimal"])
+
+
+# --- Google sign-in link and account deletion ---
+
+func find_player_by_google(google_id: String) -> Dictionary:
+	if not persistent():
+		for p: Dictionary in _players.values():
+			if str(p.get("google_id", "")) == google_id:
+				return p
+		return {}
+	var rows: Array = await _rest(HTTPClient.METHOD_GET, "players?google_id=eq.%s&select=*" % google_id.uri_encode())
+	return rows[0] if not rows.is_empty() else {}
+
+
+## The Supabase Auth user behind an access token (Google sign-in on the website), or {} if the
+## token is not valid. Only the user id is used; nothing else from the Google profile is stored.
+## Local tests (no Supabase) accept "test:<id>" tokens, and only when MAFIA_TEST_AUTH=1 is set.
+func auth_user(access_token: String) -> Dictionary:
+	if not persistent():
+		if OS.get_environment("MAFIA_TEST_AUTH") == "1" and access_token.begins_with("test:"):
+			return {"id": access_token.trim_prefix("test:")}
+		return {}
+	var res := await _raw(HTTPClient.METHOD_GET, "/auth/v1/user", PackedByteArray(), ["Authorization: Bearer " + access_token], false)
+	if res[0] != 200:
+		return {}
+	var parsed: Variant = JSON.parse_string((res[1] as PackedByteArray).get_string_from_utf8())
+	return parsed if parsed is Dictionary and str(parsed.get("id", "")) != "" else {}
+
+
+## Removes the Supabase Auth user (the Google sign-in record with the e-mail address).
+func delete_auth_user(google_id: String) -> void:
+	if not persistent() or google_id == "":
+		return
+	await _raw(HTTPClient.METHOD_DELETE, "/auth/v1/admin/users/%s" % google_id.uri_encode())
+
+
+## Paths of the chat images this player sent (stored in the private bucket).
+func images_sent_by(id: String) -> Array:
+	if not persistent():
+		return _messages.filter(func(m: Dictionary) -> bool: return m.sender == id and str(m.get("image", "")) != "").map(func(m: Dictionary) -> String: return str(m.image))
+	var rows: Array = await _rest(HTTPClient.METHOD_GET, "messages?sender=eq.%s&image=not.is.null&select=image" % id)
+	return rows.map(func(r: Dictionary) -> String: return str(r.image))
+
+
+## Every file under a folder of the bucket (profile photos of one account).
+func list_files(prefix: String) -> Array:
+	if not persistent():
+		return _files.keys().filter(func(k: String) -> bool: return k.begins_with(prefix))
+	var res := await _raw(HTTPClient.METHOD_POST, "/storage/v1/object/list/%s" % BUCKET,
+		JSON.stringify({"prefix": prefix, "limit": 1000}).to_utf8_buffer(), ["Content-Type: application/json"])
+	var parsed: Variant = JSON.parse_string((res[1] as PackedByteArray).get_string_from_utf8()) if res[0] == 200 else []
+	var out := []
+	if parsed is Array:
+		for f: Variant in parsed:
+			if f is Dictionary and str(f.get("name", "")) != "":
+				out.append(prefix.trim_suffix("/") + "/" + str(f.name))
+	return out
+
+
+## Deletes the account row; friendships, messages (both directions), blocks and reports made by the
+## player go with it (foreign keys "on delete cascade"). Files are removed by the caller first.
+func delete_player(id: String) -> bool:
+	if not persistent():
+		_players.erase(id)
+		for k: String in _friendships.keys():
+			if k.contains(id):
+				_friendships.erase(k)
+		_messages = _messages.filter(func(m: Dictionary) -> bool: return m.sender != id and m.receiver != id)
+		for k: String in _blocks.keys():
+			if k.contains(id):
+				_blocks.erase(k)
+		_reports = _reports.filter(func(r: Dictionary) -> bool: return r.reporter != id)
+		return true
+	var res := await _raw(HTTPClient.METHOD_DELETE, "/rest/v1/players?id=eq.%s" % id)
+	return res[0] >= 200 and res[0] < 300
 
 
 # --- files (profile photos, chat images) in the private Supabase Storage bucket ---
@@ -252,13 +357,13 @@ func delete_file(path: String) -> void:
 
 
 ## Binary request to Supabase (storage); returns [status code, body bytes].
-func _raw(method: int, path: String, body: PackedByteArray = PackedByteArray(), extra: Array = []) -> Array:
+func _raw(method: int, path: String, body: PackedByteArray = PackedByteArray(), extra: Array = [], service_auth: bool = true) -> Array:
 	var http := HTTPRequest.new()
 	http.timeout = 30.0
 	http.body_size_limit = 2 * 1024 * 1024
 	add_child(http)
 	var headers := PackedStringArray(["apikey: " + _key])
-	if _key.begins_with("eyJ"):
+	if service_auth and _key.begins_with("eyJ"):
 		headers.append("Authorization: Bearer " + _key)
 	for h: String in extra:
 		headers.append(h)

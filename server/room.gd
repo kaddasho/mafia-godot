@@ -42,6 +42,9 @@ var round_no: int = 0
 var host_id: String = ""
 ## {id, name, gender, country, ready, connected, alive, role, gone, drop_at}
 var players: Array[Dictionary] = []
+## Joined while a game was running (invite / join a friend): they wait in the lobby view and take a
+## seat when the room goes back to the lobby. They see no roles and get no voice or chat.
+var waiting: Array[Dictionary] = []
 
 ## Speaking turns in the discussion: everyone may talk, the turn just says whose floor it is.
 var turn_order: Array[String] = []
@@ -85,7 +88,16 @@ func is_empty() -> bool:
 	for p in players:
 		if p.connected or p.drop_at > 0:
 			return false
-	return true
+	return waiting.is_empty()
+
+
+## Seats taken, counting the players waiting for the next round.
+func seats_taken() -> int:
+	return players.size() + waiting.size()
+
+
+func is_waiting(id: String) -> bool:
+	return waiting.any(func(w: Dictionary) -> bool: return w.id == id)
 
 
 func is_open() -> bool:
@@ -101,12 +113,16 @@ func summary() -> Dictionary:
 # --- lobby ---
 
 func add_player(id: String, player_name: String, gender: String = "", country: String = "", account: String = "", avatar: int = 0, photo: String = "") -> String:
-	if phase != "lobby":
-		return "room_in_progress"
-	if players.size() >= max_players:
+	if seats_taken() >= max_players:
 		return "room_full"
-	players.append({"id": id, "name": player_name, "gender": gender, "country": country, "account": account, "avatar": avatar, "photo": photo,
-		"ready": false, "connected": true, "alive": true, "role": "", "gone": false, "drop_at": 0})
+	var p := {"id": id, "name": player_name, "gender": gender, "country": country, "account": account, "avatar": avatar, "photo": photo,
+		"ready": false, "connected": true, "alive": true, "role": "", "gone": false, "drop_at": 0}
+	if phase != "lobby":
+		# a game is running: wait for the next round instead of joining it
+		waiting.append(p)
+		_send.call(id, view_for(p))
+		return ""
+	players.append(p)
 	if host_id == "":
 		host_id = id
 	_update_auto_start()
@@ -116,6 +132,9 @@ func add_player(id: String, player_name: String, gender: String = "", country: S
 
 ## Leaving (or disconnecting) in the lobby removes the player; during a game they die and stay listed.
 func remove_player(id: String) -> void:
+	if is_waiting(id):
+		waiting = waiting.filter(func(w: Dictionary) -> bool: return w.id != id)
+		return
 	var p := find(id)
 	if p.is_empty():
 		return
@@ -143,6 +162,9 @@ func remove_player(id: String) -> void:
 
 ## Lost connection: keep the seat for grace_ms, then remove_player() runs from tick().
 func disconnect_player(id: String) -> void:
+	if is_waiting(id):  # nothing to keep for someone who was only waiting
+		remove_player(id)
+		return
 	var p := find(id)
 	if p.is_empty() or p.gone:
 		return
@@ -637,6 +659,10 @@ func _back_to_lobby() -> void:
 		p.ready = false
 		p.alive = true
 		p.role = ""
+	for w in waiting:  # the players who waited take their seats now
+		if players.size() < max_players:
+			players.append(w)
+	waiting.clear()
 	phase = "lobby"
 	deadline = 0
 	winner = ""
@@ -673,6 +699,8 @@ func broadcast() -> void:
 	for p in players:
 		if p.connected:
 			_send.call(p.id, view_for(p))
+	for w in waiting:
+		_send.call(w.id, view_for(w))
 
 
 func view_for(me: Dictionary) -> Dictionary:
@@ -733,6 +761,16 @@ func view_for(me: Dictionary) -> Dictionary:
 		"lastVote": last_vote,
 		"winner": winner,
 	}
+	if is_waiting(str(me.id)):
+		# lobby view with the game hidden: who is in the room, and "you join next round"
+		d["phase"] = "lobby"
+		d["waiting"] = true
+		d["lastNight"] = {}
+		d["lastVote"] = {}
+		for p: Dictionary in list:
+			p["role"] = null
+			p["alive"] = true
+		return d
 	if phase == "day":
 		d["skips"] = day_skips.keys()
 		d["turn"] = {"speaker": current_speaker(), "idx": turn_idx, "total": turn_order.size(),

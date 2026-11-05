@@ -25,13 +25,17 @@ var _last_msg: Dictionary = {}  # account id -> ms
 
 func handles(t: String) -> bool:
 	return t in ["auth", "friends", "search", "friend_request", "friend_respond", "friend_remove", "msg_send", "msg_history",
-		"invite", "photo_set", "photo_remove", "photo_get", "img_send", "img_get", "block", "unblock", "report"]
+		"invite", "photo_set", "photo_remove", "photo_get", "img_send", "img_get", "block", "unblock", "report",
+		"report_msg", "link_start", "link_finish", "account_delete", "privacy", "join_friend", "join_answer", "host_answer", "invite_answer"]
 
 
 func handle(c: Object, m: Dictionary) -> void:
 	var t := str(m.get("t", ""))
 	if t == "auth":
 		await _auth(c, m)
+		return
+	if t == "link_finish":  # comes from the sign-in web page, not from the app
+		await _link_finish(c, str(m.get("nonce", "")), str(m.get("access_token", "")))
 		return
 	if c.account == "":
 		_err(c, "not_signed_in")
@@ -69,6 +73,22 @@ func handle(c: Object, m: Dictionary) -> void:
 			await _report(c, str(m.get("id", "")), str(m.get("reason", "")))
 		"invite":
 			await _invite(c, str(m.get("to", "")))
+		"report_msg":
+			await _report_msg(c, int(m.get("id", 0)), str(m.get("reason", "")))
+		"link_start":
+			_link_start(c, str(m.get("nonce", "")))
+		"account_delete":
+			await _account_delete(c)
+		"privacy":
+			await _privacy(c, m)
+		"join_friend":
+			await _join_friend(c, str(m.get("id", "")))
+		"join_answer":
+			await _join_answer(c, str(m.get("from", "")), bool(m.get("accept", false)))
+		"host_answer":
+			_host_answer(c, str(m.get("from", "")), bool(m.get("accept", false)))
+		"invite_answer":
+			await _invite_answer(c, str(m.get("to", "")), bool(m.get("accept", false)))
 
 
 ## Called by the server when a connection closes.
@@ -123,13 +143,23 @@ func _auth(c: Object, m: Dictionary) -> void:
 	elif p.secret_hash != _hash(secret):
 		_err(c, "auth_failed")
 		return
+	elif bool(p.get("banned", false)):
+		_err(c, "banned")  # suspended by a moderator after reports
+		return
 	else:
 		await store.update_player(id, profile.merged({"last_seen": Time.get_datetime_string_from_system(true) + "Z"}))
 		p.merge(profile, true)
+	if c.account != "" and c.account != id and online.get(c.account) == c:
+		online.erase(c.account)  # this phone signed out and now uses another account
+		await _tell_friends(c.account)
+	c.show_online = bool(m.get("show_online", true))
+	c.allow_join = bool(m.get("allow_join", true))
+	c.profile = {"name": profile.name, "gender": profile.gender, "country": profile.country, "avatar": clampi(int(m.get("avatar", 0)), 0, 15)}
 	c.account = id
 	c.photo = str(p.get("photo", "")) if p.get("photo") != null else ""
 	online[id] = c
-	_send(c, {"t": "me", "id": id, "name": p.name, "tag": int(p.tag), "photo": c.photo, "persistent": store.persistent()})
+	_send(c, {"t": "me", "id": id, "name": p.name, "tag": int(p.tag), "photo": c.photo, "persistent": store.persistent(),
+		"google": str(p.get("google_id", "")) not in ["", "<null>"]})
 	await send_friends(c)
 	await _tell_friends(id)
 
@@ -149,13 +179,18 @@ func send_friends(c: Object) -> void:
 	var unread: Dictionary = await store.unread_counts(me)
 	var list := []
 	for p: Dictionary in people:
-		var friend_client: Object = online.get(p.id)
 		var status: String = others[p.id]
+		var friend_client: Object = online.get(p.id) if status == "friend" else null
+		if friend_client != null and not friend_client.show_online:
+			friend_client = null  # appears offline (privacy); the room is never shown either
+		var playing: bool = friend_client != null and friend_client.room_code != ""
 		list.append({
 			"id": p.id, "name": p.name, "gender": p.get("gender", ""), "country": p.get("country", ""), "tag": int(p.get("tag", 0)),
 			"photo": _photo_of(p), "status": status,
-			"online": friend_client != null and status == "friend",
-			"room": friend_client.room_code if friend_client != null and status == "friend" else "",
+			"online": friend_client != null,
+			"state": "offline" if friend_client == null else ("playing" if playing else "available"),
+			# how you can join them: "direct" (they allow it), "request" (they approve each time), "" = no
+			"join": ("direct" if friend_client.allow_join else "request") if playing else "",
 			"unread": int(unread.get(p.id, 0)),
 		})
 	# people you blocked, so you can unblock them
@@ -281,12 +316,23 @@ func _invite(c: Object, to: String) -> void:
 		_err(c, "not_friends")
 		return
 	var target: Object = online.get(to)
-	if target == null:
+	if target == null or not target.show_online:
 		_err(c, "friend_offline")
 		return
-	var p: Dictionary = await store.get_player(c.account)
-	_send(target, {"t": "invite", "code": c.room_code,
-		"from": {"id": c.account, "name": p.get("name", ""), "country": p.get("country", ""), "gender": p.get("gender", "")}})
+	var room: Object = server.room_of(c)
+	if room != null and not room.is_public and room.host_id != c.id:
+		# private room: the host approves invitations sent by other players
+		var host: Object = server.client(room.host_id)
+		if host == null or host.account == "":
+			_err(c, "need_host")
+			return
+		var tp: Dictionary = await store.get_player(to)
+		_pending_invites[room.code + ":" + to] = c.account
+		_send(host, {"t": "invite_ask", "from": _card(c), "to": {"id": to, "name": tp.get("name", "")}})
+		_send(c, {"t": "invite_pending"})
+		return
+	_send(target, {"t": "invite", "code": c.room_code, "from": _card(c)})
+	_send(c, {"t": "invite_sent"})
 
 
 # --- pushing changes ---
@@ -413,7 +459,7 @@ func _img_send(c: Object, to: String, data: String, body: String, ref: String) -
 func _img_get(c: Object, id: int) -> void:
 	var m: Dictionary = await store.get_message(id)
 	var path := str(m.get("image", "")) if m.get("image") != null else ""
-	if path == "" or (m.get("sender") != c.account and m.get("receiver") != c.account):
+	if path == "" or bool(m.get("hidden", false)) or (m.get("sender") != c.account and m.get("receiver") != c.account):
 		_send(c, {"t": "img", "id": id, "data": ""})
 		return
 	var bytes: PackedByteArray = await store.get_file(path)
@@ -424,6 +470,10 @@ func _img_get(c: Object, id: int) -> void:
 static func _public_msg(row: Dictionary) -> Dictionary:
 	var out := row.duplicate()
 	out["image"] = row.get("image") != null and str(row.get("image", "")) != ""
+	if bool(row.get("hidden", false)):  # reported: neither text nor picture is handed out any more
+		out["body"] = ""
+		out["image"] = false
+		out["hidden"] = true
 	return out
 
 
@@ -447,3 +497,243 @@ func _report(c: Object, other: String, reason: String) -> void:
 		return
 	await store.add_report(c.account, other, reason.strip_edges().left(REPORT_MAX))
 	_send(c, {"t": "reported", "id": other})
+
+## Report one message or image you received: it is stored for the moderator together with the
+## sender, and hidden for both of you at once (the image is no longer handed out to anyone).
+func _report_msg(c: Object, id: int, reason: String) -> void:
+	var m: Dictionary = await store.get_message(id) if id > 0 else {}
+	if m.is_empty() or str(m.get("receiver", "")) != c.account:
+		_err(c, "bad_target")
+		return
+	var image := str(m.get("image", "")) if m.get("image") != null else ""
+	await store.add_report(c.account, str(m.sender), reason.strip_edges().left(REPORT_MAX), id, image)
+	await store.hide_message(id)
+	m["hidden"] = true
+	var out := {"t": "msg_hidden", "id": id}
+	_send(c, out)
+	var sender: Object = online.get(str(m.sender))
+	if sender != null:
+		_send(sender, out)
+	_send(c, {"t": "reported", "id": str(m.sender), "message": id})
+
+
+# --- Google sign-in (links the device account to a Google account, or restores it on a new phone) ---
+# 1. The app sends link_start with a random one-time code and opens the sign-in page in the browser.
+# 2. The page signs in with Google through Supabase Auth and sends link_finish with that code and
+#    its access token over its own WebSocket. 3. The server checks the token with Supabase.
+
+const LINK_TTL_MS := 10 * 60 * 1000
+var _links: Dictionary = {}  # one-time code -> {client, at}
+
+
+func _link_start(c: Object, nonce: String) -> void:
+	if nonce.length() < 32 or not nonce.is_valid_hex_number():
+		_err(c, "bad_target")
+		return
+	var now := Time.get_ticks_msec()
+	for k: String in _links.keys():  # forget old codes
+		if now - int(_links[k].at) > LINK_TTL_MS:
+			_links.erase(k)
+	_links[nonce] = {"client": c, "at": now}
+
+
+func _link_finish(page: Object, nonce: String, access_token: String) -> void:
+	var link: Dictionary = _links.get(nonce, {})
+	_links.erase(nonce)  # each code works once
+	var app: Object = link.get("client")
+	if link.is_empty() or Time.get_ticks_msec() - int(link.at) > LINK_TTL_MS or app == null or app.account == "":
+		_send(page, {"t": "link_done", "ok": false, "code": "expired"})
+		return
+	var user: Dictionary = await store.auth_user(access_token)
+	var gid := str(user.get("id", ""))
+	if gid == "":
+		_send(page, {"t": "link_done", "ok": false, "code": "auth_failed"})
+		_send(app, {"t": "link_failed"})
+		return
+	var owner: Dictionary = await store.find_player_by_google(gid)
+	if not owner.is_empty() and str(owner.id) != app.account:
+		if bool(owner.get("banned", false)):
+			_send(page, {"t": "link_done", "ok": false, "code": "banned"})
+			_send(app, {"t": "link_failed", "code": "banned"})
+			return
+		# this Google account already has a game account: hand it to this phone with a new secret
+		var secret := Crypto.new().generate_random_bytes(32).hex_encode()
+		await store.update_player(str(owner.id), {"secret_hash": _hash(secret)})
+		var old: Object = online.get(str(owner.id))
+		if old != null and old != app:
+			_err(old, "signed_in_elsewhere")
+		_send(app, {"t": "account_restore", "account": str(owner.id), "secret": secret})
+	else:
+		await store.update_player(app.account, {"google_id": gid})
+		_send(app, {"t": "linked"})
+	_send(page, {"t": "link_done", "ok": true})
+
+
+# --- account deletion (Google Play: in the app and on the website) ---
+
+## Deletes the account for good: profile photos, the images this player sent, the account row with
+## its friendships, messages, blocks and reports, and the Google sign-in record.
+func _account_delete(c: Object) -> void:
+	var id: String = c.account
+	var p: Dictionary = await store.get_player(id)
+	for path: String in await store.list_files("photos/%s/" % id):
+		await store.delete_file(path)
+	for path: String in await store.images_sent_by(id):
+		await store.delete_file(path)
+	var friends: Array = (await store.get_friendships(id)).map(func(f: Dictionary) -> String: return str(f.b if f.a == id else f.a))
+	var ok: bool = await store.delete_player(id)
+	if not ok:
+		_err(c, "storage_error")
+		return
+	var gid := str(p.get("google_id", "")) if p.get("google_id") != null else ""
+	await store.delete_auth_user(gid)
+	online.erase(id)
+	c.account = ""
+	c.photo = ""
+	_send(c, {"t": "account_deleted"})
+	for other: String in friends:
+		await _refresh(other)
+
+# --- privacy, joining friends, approvals, blocked players in the same room ---
+
+var _pending_invites: Dictionary = {}  # "<room code>:<invited account>" -> account of the friend who invited
+var _join_requests: Dictionary = {}  # "<friend account>><requester account>" -> true (waiting for the friend)
+var _host_requests: Dictionary = {}  # "<room code>:<requester account>" -> true (waiting for the host)
+
+
+## Small public card of a signed-in player (invites, requests).
+func _card(c: Object) -> Dictionary:
+	return {"id": c.account, "name": c.profile.get("name", ""), "country": c.profile.get("country", ""), "gender": c.profile.get("gender", "")}
+
+
+## "Show me as online" and "friends may join me" switches from the app.
+func _privacy(c: Object, m: Dictionary) -> void:
+	if m.has("show_online"):
+		c.show_online = bool(m.show_online)
+	if m.has("allow_join"):
+		c.allow_join = bool(m.allow_join)
+	await _tell_friends(c.account)
+
+
+## "Join" next to a friend in the list. They must be a friend, online and visible, and in a room.
+func _join_friend(c: Object, to: String) -> void:
+	var friends: bool = await _are_friends(c.account, to)
+	var target: Object = online.get(to)
+	if not friends or target == null or not target.show_online or target.room_code == "":
+		_err(c, "friend_unavailable")
+		return
+	if target.room_code == c.room_code:
+		return
+	if not target.allow_join:
+		# they decide each time
+		_join_requests[to + ">" + c.account] = true
+		_send(target, {"t": "join_request", "from": _card(c)})
+		_send(c, {"t": "join_requested"})
+		return
+	_try_join(c, target)
+
+
+## The friend answers "X wants to join you".
+func _join_answer(c: Object, from: String, accept: bool) -> void:
+	var key: String = c.account + ">" + from
+	if not _join_requests.has(key):
+		return
+	_join_requests.erase(key)
+	var requester: Object = online.get(from)
+	if requester == null:
+		return
+	if not accept:
+		_err(requester, "join_declined")
+		return
+	_try_join(requester, c)
+
+
+## Room checks shared by every way of joining a friend: full rooms say so, private rooms need their
+## host (unless the friend is the host), a running game means waiting for the next round.
+func _try_join(c: Object, friend: Object) -> void:
+	var room: Object = server.room_of(friend)
+	if room == null:
+		_err(c, "friend_unavailable")
+		return
+	if room.seats_taken() >= room.max_players:
+		_err(c, "room_full")
+		return
+	if not room.is_public and room.host_id != friend.id:
+		var host: Object = server.client(room.host_id)
+		if host == null:
+			_err(c, "need_host")
+			return
+		_host_requests[room.code + ":" + c.account] = true
+		_send(host, {"t": "join_ask_host", "from": _card(c), "via": friend.profile.get("name", "")})
+		_send(c, {"t": "join_requested", "host": true})
+		return
+	server.join_room(c, room)
+
+
+## The host of a private room answers "X (friend of Y) wants to join".
+func _host_answer(c: Object, from: String, accept: bool) -> void:
+	var room: Object = server.room_of(c)
+	if room == null or room.host_id != c.id:
+		return
+	var key: String = room.code + ":" + from
+	if not _host_requests.has(key):
+		return
+	_host_requests.erase(key)
+	var requester: Object = online.get(from)
+	if requester == null:
+		return
+	if not accept:
+		_err(requester, "join_declined")
+	elif room.seats_taken() >= room.max_players:
+		_err(requester, "room_full")
+	else:
+		server.join_room(requester, room)
+
+
+## The host of a private room answers "X wants to invite Y".
+func _invite_answer(c: Object, to: String, accept: bool) -> void:
+	var room: Object = server.room_of(c)
+	if room == null or room.host_id != c.id:
+		return
+	var key: String = room.code + ":" + to
+	var inviter_id: String = _pending_invites.get(key, "")
+	if inviter_id == "":
+		return
+	_pending_invites.erase(key)
+	var inviter: Object = online.get(inviter_id)
+	if not accept:
+		if inviter != null:
+			_err(inviter, "invite_declined")
+		return
+	var target: Object = online.get(to)
+	if target == null or not target.show_online:
+		if inviter != null:
+			_err(inviter, "friend_offline")
+		return
+	_send(target, {"t": "invite", "code": room.code, "from": _card(inviter) if inviter != null else _card(c)})
+	if inviter != null:
+		_send(inviter, {"t": "invite_sent"})
+
+
+## Entering a room with someone you blocked (or who blocked you): only a notice to the one who
+## blocked, who decides to stay or leave. Nothing is told to the blocked player.
+func block_alert(c: Object, room: Object) -> void:
+	if c.account == "":
+		return
+	var here := {}  # account -> [client, name]
+	for p: Dictionary in room.players + room.waiting:
+		var other: Object = server.client(str(p.id))
+		if other != null and other != c and other.account != "":
+			here[other.account] = [other, str(p.name)]
+	if here.is_empty():
+		return
+	var mine: Array = await store.blocked_by(c.account)
+	var names := []
+	for acc: String in mine:
+		if here.has(acc):
+			names.append(here[acc][1])
+	if not names.is_empty():
+		_send(c, {"t": "blocked_here", "names": names})
+	for acc: String in await store.blockers_of(c.account):
+		if here.has(acc):
+			_send(here[acc][0], {"t": "blocked_here", "names": [c.profile.get("name", "")]})
