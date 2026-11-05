@@ -11,6 +11,8 @@ const RESULT_MS := 7000
 const ENDED_MS := 20000
 const REACTIONS := 7  # emoji 0..6, drawn by the client
 const REACT_GAP_MS := 400  # per player, to stop spam
+const CHAT_GAP_MS := 600  # per player, to stop spam
+const CHAT_MAX := 200  # characters per chat line
 ## Phase lengths (ms) the host picks in the lobby; "turn" is each speaker's time in the discussion.
 const PACES := {
 	"short": {"night": 30000, "day": 60000, "vote": 30000, "turn": 20000},
@@ -46,6 +48,7 @@ var turn_order: Array[String] = []
 var turn_idx: int = -1  # -1 = no current speaker (open floor after the last turn)
 var turn_deadline: int = 0
 var _last_react: Dictionary = {}  # player id -> ms
+var _last_chat: Dictionary = {}  # player id -> ms
 
 var night_actions: Dictionary = {}  # actor id -> target id
 var day_skips: Dictionary = {}  # player id -> true
@@ -97,12 +100,12 @@ func summary() -> Dictionary:
 
 # --- lobby ---
 
-func add_player(id: String, player_name: String, gender: String = "", country: String = "", account: String = "") -> String:
+func add_player(id: String, player_name: String, gender: String = "", country: String = "", account: String = "", avatar: int = 0) -> String:
 	if phase != "lobby":
 		return "room_in_progress"
 	if players.size() >= max_players:
 		return "room_full"
-	players.append({"id": id, "name": player_name, "gender": gender, "country": country, "account": account,
+	players.append({"id": id, "name": player_name, "gender": gender, "country": country, "account": account, "avatar": avatar,
 		"ready": false, "connected": true, "alive": true, "role": "", "gone": false, "drop_at": 0})
 	if host_id == "":
 		host_id = id
@@ -232,6 +235,38 @@ func react(id: String, emoji: int) -> String:
 		if q.connected:
 			_send.call(q.id, {"t": "react", "from": id, "e": emoji})
 	return ""
+
+
+## Text chat in the room. Same rule as voice (who may talk now reaches whoever may hear them);
+## the sender also gets their own line back. At night the mafia's lines are marked "team".
+func chat(id: String, text: String) -> String:
+	var p := find(id)
+	if p.is_empty():
+		return "not_in_room"
+	text = text.strip_edges().replace("\n", " ").left(CHAT_MAX)
+	if text == "":
+		return ""
+	var now := now_ms()
+	if now - int(_last_chat.get(id, 0)) < CHAT_GAP_MS:
+		return ""  # too fast: silently dropped
+	var targets := voice_targets(id)
+	if targets.is_empty() and TALK_PHASES.has(phase) and (not p.alive or (phase == "night" and p.role != "mafia")):
+		return "cant_talk_now"
+	_last_chat[id] = now
+	var line := {"t": "chat", "from": id, "name": p.name, "text": text, "team": phase == "night"}
+	_send.call(id, line)
+	for t in targets:
+		_send.call(t, line)
+	return ""
+
+
+## The player's own mute switch, shown to the others as a small red badge.
+func set_muted(id: String, on: bool) -> void:
+	var p := find(id)
+	if p.is_empty() or bool(p.get("muted", false)) == on:
+		return
+	p["muted"] = on
+	broadcast()
 
 
 func _ms(phase_name: String) -> int:
@@ -641,10 +676,12 @@ func view_for(me: Dictionary) -> Dictionary:
 			"name": p.name,
 			"gender": p.gender,
 			"country": p.country,
+			"avatar": p.get("avatar", 0),  # chosen portrait 1..15, 0 = none
 			"account": p.account,  # public account id, so players can add each other as friends
 			"ready": p.ready,
 			"host": p.id == host_id,
 			"connected": p.connected,
+			"muted": bool(p.get("muted", false)),
 			"alive": p.alive,
 			"role": p.role if visible and p.role != "" else null,
 		})

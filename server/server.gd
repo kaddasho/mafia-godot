@@ -133,7 +133,7 @@ func _handle(c: Client, text: String) -> void:
 					target = r
 					break
 			if target == null:
-				target = _new_room(player_name, true, 12)
+				target = _new_room(player_name, true, Room.MAX_PLAYERS)
 				target.lang = str(m.get("lang", ""))
 				target.auto_start = true  # quick-play rooms start themselves; hosted rooms wait for the host
 			err = _enter_room(c, target, player_name, m)
@@ -167,6 +167,11 @@ func _handle(c: Client, text: String) -> void:
 			err = "not_in_room" if room == null else room.turn(c.id, str(m.get("action", "")), str(m.get("target", "")))
 		"react":
 			err = "not_in_room" if room == null else room.react(c.id, int(m.get("e", -1)))
+		"chat":
+			err = "not_in_room" if room == null else room.chat(c.id, str(m.get("text", "")))
+		"mute":
+			if room != null:
+				room.set_muted(c.id, bool(m.get("on", false)))
 		"act":
 			err = "not_in_room" if room == null else room.act(c.id, str(m.get("target", "")))
 		"skip":
@@ -240,7 +245,8 @@ func _enter_room(c: Client, room: Room, player_name: String, m: Dictionary) -> S
 	var country := str(m.get("country", "")).strip_edges().to_lower()
 	if country.length() != 2 or not country.is_valid_identifier():
 		country = ""
-	var err := room.add_player(c.id, player_name, gender, country, c.account)
+	var avatar := clampi(int(m.get("avatar", 0)), 0, 15)
+	var err := room.add_player(c.id, player_name, gender, country, c.account, avatar)
 	if err == "":
 		c.room_code = room.code
 		_social.room_changed(c)
