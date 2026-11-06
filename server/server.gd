@@ -22,6 +22,7 @@ class Client:
 	var show_online: bool = true  # privacy: friends see this player as online (false = appear offline)
 	var allow_join: bool = true  # privacy: friends may join this player's room without asking
 	var profile: Dictionary = {}  # name / gender / country / avatar from the last sign-in
+	var progress: Dictionary = {}  # level / frame / title shown on this player's seat
 
 
 var _tcp := TCPServer.new()
@@ -229,6 +230,7 @@ func _resume(c: Client, token: String) -> void:
 		c.account = old.account
 		c.photo = old.photo
 		c.profile = old.profile
+		c.progress = old.progress
 		c.show_online = old.show_online
 		c.allow_join = old.allow_join
 		_social.online[old.account] = c
@@ -244,6 +246,7 @@ func _new_room(room_name: String, public: bool, max_count: int) -> Room:
 		for i in 4:
 			code += CODE_CHARS[randi() % CODE_CHARS.length()]
 	var room := Room.new(code, room_name, public, max_count, _send)
+	room.on_game_over = func(results: Array) -> void: _social.record_match(results, room)
 	_rooms[code] = room
 	return room
 
@@ -264,7 +267,7 @@ func _enter_room(c: Client, room: Room, player_name: String, m: Dictionary) -> S
 	if country.length() != 2 or not country.is_valid_identifier():
 		country = ""
 	var avatar := clampi(int(m.get("avatar", 0)), 0, 15)
-	var err := room.add_player(c.id, player_name, gender, country, c.account, avatar, c.photo)
+	var err := room.add_player(c.id, player_name, gender, country, c.account, avatar, c.photo, _social.room_extra(c))
 	if err == "":
 		c.room_code = room.code
 		_social.room_changed(c)

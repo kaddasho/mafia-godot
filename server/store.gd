@@ -65,6 +65,24 @@ func get_players(ids: Array) -> Array:
 	return await _rest(HTTPClient.METHOD_GET, "players?id=in.(%s)&select=id,name,gender,country,tag,photo" % ",".join(ids))
 
 
+## Leaderboard rows: id, profile and progress of the players with the most rank points this season.
+func top_progress(season: String, limit: int) -> Array:
+	if not persistent():
+		var list: Array = _players.values().filter(func(p: Dictionary) -> bool:
+			return p.get("progress") is Dictionary and str(p.progress.get("season", "")) == season)
+		list.sort_custom(func(x: Dictionary, y: Dictionary) -> bool: return int(x.progress.get("rp", 0)) > int(y.progress.get("rp", 0)))
+		return list.slice(0, limit)
+	return await _rest(HTTPClient.METHOD_GET, "players?progress->>season=eq.%s&select=id,name,gender,country,tag,photo,progress&order=progress->rp.desc.nullslast&limit=%d" % [season, limit])
+
+
+## The same rows for a list of players (friends leaderboard).
+func players_progress(ids: Array) -> Array:
+	if ids.is_empty():
+		return []
+	if not persistent():
+		return ids.filter(func(i: String) -> bool: return _players.has(i)).map(func(i: String) -> Dictionary: return _players[i])
+	return await _rest(HTTPClient.METHOD_GET, "players?id=in.(%s)&select=id,name,gender,country,tag,photo,progress" % ",".join(ids))
+
 ## By name (part of it) or by exact "name#1234".
 func search_players(q: String) -> Array:
 	var name := q

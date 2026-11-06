@@ -62,6 +62,12 @@ var last_vote: Dictionary = {}
 var winner: String = ""
 
 var _send: Callable
+## Called once when a game ends, with one result per player (progression: XP, achievements).
+var on_game_over: Callable = Callable()
+var game_id: String = ""
+var _kills: Dictionary = {}  # mafia player id -> night kills they voted for that went through
+var _voted_against: Dictionary = {}  # player id -> votes received over the whole game
+var _healed: Dictionary = {}  # player id -> the doctor protected them at least once
 
 
 func _init(room_code: String, room_name: String, public: bool, max_count: int, send: Callable) -> void:
@@ -112,11 +118,12 @@ func summary() -> Dictionary:
 
 # --- lobby ---
 
-func add_player(id: String, player_name: String, gender: String = "", country: String = "", account: String = "", avatar: int = 0, photo: String = "") -> String:
+func add_player(id: String, player_name: String, gender: String = "", country: String = "", account: String = "", avatar: int = 0, photo: String = "", extra: Dictionary = {}) -> String:
 	if seats_taken() >= max_players:
 		return "room_full"
 	var p := {"id": id, "name": player_name, "gender": gender, "country": country, "account": account, "avatar": avatar, "photo": photo,
-		"ready": false, "connected": true, "alive": true, "role": "", "gone": false, "drop_at": 0}
+		"ready": false, "connected": true, "alive": true, "role": "", "gone": false, "drop_at": 0,
+		"level": int(extra.get("level", 0)), "frame": str(extra.get("frame", "")), "title": str(extra.get("title", ""))}
 	if phase != "lobby":
 		# a game is running: wait for the next round instead of joining it
 		waiting.append(p)
@@ -479,6 +486,10 @@ func _begin_game() -> void:
 	last_night = {}
 	last_vote = {}
 	checks = {}
+	_kills = {}
+	_voted_against = {}
+	_healed = {}
+	game_id = "%s-%d" % [code, now_ms()]
 	var roles := _role_list(players.size())
 	roles.shuffle()
 	for i in players.size():
@@ -592,11 +603,16 @@ func _resolve_night() -> void:
 		victim = top.pick_random()
 	last_night = {"round": round_no, "killed": "", "saved": false}
 	if victim != "":
+		if heal != "":
+			_healed[heal] = true
 		if victim == heal:
 			last_night.saved = true
 		else:
 			find(victim).alive = false
 			last_night.killed = victim
+			for actor_id: String in night_actions:  # the mafia who chose this victim get the kill
+				if night_actions[actor_id] == victim and find(actor_id).get("role", "") == "mafia":
+					_kills[actor_id] = int(_kills.get(actor_id, 0)) + 1
 	if not _check_win():
 		_enter("day", _ms("day"))
 
@@ -606,6 +622,8 @@ func _resolve_vote() -> void:
 	for voter: String in votes:
 		var target: String = votes[voter]
 		tally[target] = int(tally.get(target, 0)) + 1
+		if target != "":
+			_voted_against[target] = int(_voted_against.get(target, 0)) + 1
 	# Nobody leaves on a tie, or when "skip" wins.
 	var out := ""
 	var top: Array = _most_voted(tally)
@@ -647,8 +665,58 @@ func _check_win() -> bool:
 		winner = "mafia"
 	else:
 		return false
+	if on_game_over.is_valid():
+		on_game_over.call(game_results())
 	_enter("ended", ENDED_MS)
 	return true
+
+
+## One entry per player still in the room at the end (players who left are not counted).
+func game_results() -> Array:
+	var out := []
+	var alive_mafia := players.filter(func(p: Dictionary) -> bool: return p.alive and p.role == "mafia").size()
+	var total_mafia := players.filter(func(p: Dictionary) -> bool: return p.role == "mafia").size()
+	var accounts := []  # signed-in players of this game, sorted: the "group" for anti-farming
+	for p in players:
+		if str(p.get("account", "")) != "" and not accounts.has(p.account):
+			accounts.append(p.account)
+	accounts.sort()
+	for p in players:
+		if p.gone or str(p.get("account", "")) == "":
+			continue
+		var team := "mafia" if p.role == "mafia" else "town"
+		var team_alive := players.all(func(q: Dictionary) -> bool:
+			return q.alive or (q.role == "mafia") != (team == "mafia"))
+		var correct := 0
+		var found := {}
+		for c: Dictionary in checks.get(p.id, []):
+			if bool(c.get("mafia", false)):
+				correct += 1
+				found[c.target] = true
+		var team_left := players.filter(func(q: Dictionary) -> bool:
+			return q.alive and not q.gone and (q.role == "mafia") == (team == "mafia")).size()
+		out.append({"account": p.account, "role": p.role, "won": winner == team, "survived": p.alive,
+			"team_all_alive": team_alive, "kills": int(_kills.get(p.id, 0)),
+			"voted_against": int(_voted_against.get(p.id, 0)), "correct_checks": correct,
+			"all_mafia_found": total_mafia > 0 and found.size() >= total_mafia,
+			"last_mafia": p.role == "mafia" and p.alive and alive_mafia == 1,
+			"last_standing": winner == team and p.alive and team_left == 1,
+			"healed": bool(_healed.get(p.id, false)), "big_game": players.size() >= 8,
+			"players": accounts.size(), "rounds": round_no, "group": accounts})
+	return out
+
+
+## A player's level / frame / title changed (after a game or when they equip): seats update.
+func set_progress(account: String, level: int, frame: String, title: String) -> void:
+	var changed := false
+	for p in players + waiting:
+		if str(p.get("account", "")) == account:
+			p.level = level
+			p.frame = frame
+			p.title = title
+			changed = true
+	if changed:
+		broadcast()
 
 
 func _back_to_lobby() -> void:
@@ -720,6 +788,9 @@ func view_for(me: Dictionary) -> Dictionary:
 			"host": p.id == host_id,
 			"connected": p.connected,
 			"muted": bool(p.get("muted", false)),
+			"level": int(p.get("level", 0)),
+			"frame": str(p.get("frame", "")),
+			"title": str(p.get("title", "")),
 			"alive": p.alive,
 			"role": p.role if visible and p.role != "" else null,
 		})
