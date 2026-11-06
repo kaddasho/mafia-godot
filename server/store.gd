@@ -62,7 +62,7 @@ func get_players(ids: Array) -> Array:
 		return []
 	if not persistent():
 		return ids.filter(func(i: String) -> bool: return _players.has(i)).map(func(i: String) -> Dictionary: return _players[i])
-	return await _rest(HTTPClient.METHOD_GET, "players?id=in.(%s)&select=id,name,gender,country,tag,photo" % ",".join(ids))
+	return await _rest(HTTPClient.METHOD_GET, "players?id=in.(%s)&select=id,name,gender,country,tag,photo,progress" % ",".join(ids))
 
 
 ## Leaderboard rows: id, profile and progress of the players with the most rank points this season.
@@ -74,6 +74,60 @@ func top_progress(season: String, limit: int) -> Array:
 		return list.slice(0, limit)
 	return await _rest(HTTPClient.METHOD_GET, "players?progress->>season=eq.%s&select=id,name,gender,country,tag,photo,progress&order=progress->rp.desc.nullslast&limit=%d" % [season, limit])
 
+
+## Best-rated players (only those who played ranked games), highest RP first. `filter`:
+## {"season": "2026-11"} (played ranked this season) and / or {"country": "sy"}.
+func top_rated(filter: Dictionary, limit: int) -> Array:
+	if not persistent():
+		var list: Array = _players.values().filter(func(p: Dictionary) -> bool: return _rated_match(p, filter))
+		list.sort_custom(func(x: Dictionary, y: Dictionary) -> bool: return int(x.get("rp", 1000)) > int(y.get("rp", 1000)))
+		return list.slice(0, limit)
+	return await _rest(HTTPClient.METHOD_GET, "players?%s&select=id,name,gender,country,tag,photo,progress&order=rp.desc&limit=%d" % [_rated_query(filter), limit])
+
+
+## How many rated players (same filter) have more RP than `rp` - your place is this + 1.
+func count_rated_above(filter: Dictionary, rp: int) -> int:
+	if not persistent():
+		return _players.values().filter(func(p: Dictionary) -> bool: return _rated_match(p, filter) and int(p.get("rp", 1000)) > rp).size()
+	return await _count("players?select=id&%s&rp=gt.%d" % [_rated_query(filter), rp])
+
+
+func _rated_match(p: Dictionary, filter: Dictionary) -> bool:
+	if int(p.get("ranked_games", 0)) <= 0:
+		return false
+	if filter.has("season") and (str(p.get("season", "")) != filter.season or int(p.get("season_games", 0)) <= 0):
+		return false
+	if filter.has("country") and str(p.get("country", "")) != filter.country:
+		return false
+	return true
+
+
+func _rated_query(filter: Dictionary) -> String:
+	var q := "ranked_games=gt.0"
+	if filter.has("season"):
+		q += "&season=eq.%s&season_games=gt.0" % str(filter.season).uri_encode()
+	if filter.has("country"):
+		q += "&country=eq.%s" % str(filter.country).uri_encode()
+	return q
+
+
+## Number of rows a PostgREST query matches (exact count from the Content-Range header).
+func _count(path: String) -> int:
+	var http := HTTPRequest.new()
+	http.timeout = 15.0
+	add_child(http)
+	var headers := PackedStringArray(["apikey: " + _key, "Prefer: count=exact", "Range: 0-0"])
+	if _key.begins_with("eyJ"):
+		headers.append("Authorization: Bearer " + _key)
+	if http.request(_url + "/rest/v1/" + path, headers, HTTPClient.METHOD_GET) != OK:
+		http.queue_free()
+		return 0
+	var res: Array = await http.request_completed
+	http.queue_free()
+	for h: String in res[2]:
+		if h.to_lower().begins_with("content-range:"):
+			return int(h.get_slice("/", 1).strip_edges())
+	return 0
 
 ## The same rows for a list of players (friends leaderboard).
 func players_progress(ids: Array) -> Array:

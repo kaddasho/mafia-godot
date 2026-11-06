@@ -18,11 +18,18 @@ const RANKED_MIN_PLAYERS := 5
 const RANKED_MIN_ROUNDS := 2
 const SAME_GROUP_WINDOW := 2 * 3600  # seconds: the same group again soon earns less (half, then nothing)
 
-## id, minimum RP. Index 8 and up are the legendary ranks.
+## Competitive rating (RP): Elo. Everyone starts at 1000; a game moves your RP by
+## K * (result - expected), where "expected" comes from your team's average RP against the other
+## team's. Beating stronger teams earns more, losing to weaker ones costs more. XP is separate.
+const START_RP := 1000
+const RATING_VERSION := 2  # progress saved before Elo (0-based points) is moved onto the 1000 scale once
+const SEASON_MIN_GAMES := 10  # ranked games in a season before its final rank counts for season rewards
+
+## id, minimum RP. Index 8 and up are the legendary ranks. New players start in Bronze (1000).
 const RANKS := [
-	["rookie", 0], ["bronze", 100], ["silver", 300], ["gold", 600], ["platinum", 1000], ["diamond", 1500],
-	["master", 2100], ["grandmaster", 2800],
-	["crime_lord", 3600], ["underworld_legend", 4500], ["godfather", 5500], ["immortal_legend", 6600],
+	["rookie", 0], ["bronze", 1000], ["silver", 1100], ["gold", 1200], ["platinum", 1300], ["diamond", 1400],
+	["master", 1500], ["grandmaster", 1600],
+	["crime_lord", 1700], ["underworld_legend", 1800], ["godfather", 1900], ["immortal_legend", 2000],
 ]
 const LEGENDARY_RANK := 8
 
@@ -80,6 +87,10 @@ const FRAMES := {
 	"underworld_crown": [["rank", 9], "legendary"],
 	"last_don": [["rank", 10], "legendary"],
 	"eternal_godfather": [["rank", 11], "mythic"],
+	# season rewards: the final rank of a finished season (with at least SEASON_MIN_GAMES ranked games)
+	"season_laurel": [["season", 3], "rare"],
+	"season_star": [["season", 5], "epic"],
+	"season_crown": [["season", 7], "legendary"],
 	"phantom_legend": [["all", "secret"], "mythic"],
 	"emperor_of_crime": [["all", "legendary"], "mythic"],
 }
@@ -102,6 +113,8 @@ const TITLES := {
 	"the_last_don": [["rank", 10], "legendary"],
 	"emperor_underworld": [["rank", 9], "legendary"],
 	"eternal_godfather": [["rank", 11], "mythic"],
+	"season_contender": [["season", 3], "rare"],
+	"season_champion": [["season", 7], "legendary"],
 	"the_immortal": [["ach", "wins_100"], "legendary"],
 }
 
@@ -138,7 +151,8 @@ static func season_now() -> String:
 static func clean(raw: Variant) -> Dictionary:
 	var p: Dictionary = raw.duplicate(true) if raw is Dictionary else {}
 	p["xp"] = int(p.get("xp", 0))
-	p["rp"] = int(p.get("rp", 0))
+	var had_points := p.has("rp")
+	p["rp"] = int(p.get("rp", START_RP))
 	p["best_rank"] = int(p.get("best_rank", 0))
 	if not p.get("s") is Dictionary:
 		p["s"] = {}
@@ -151,15 +165,34 @@ static func clean(raw: Variant) -> Dictionary:
 	p["f"] = str(p.get("f", ""))
 	p["t"] = str(p.get("t", ""))
 	p["g"] = str(p.get("g", ""))
-	# a new season: the old one is kept in the history, points are halved (soft reset)
+	p["sg"] = int(p.get("sg", 0))  # ranked games this season
+	p["rk"] = int(p.get("rk", 0))  # ranked games ever
+	if int(p.get("rv", 0)) < RATING_VERSION:
+		# saved before Elo: old points (from 0) become a head start on the 1000 scale, nothing is lost
+		p.rp = START_RP + int(p.rp) if had_points else START_RP
+		p["rv"] = RATING_VERSION
+		p.best_rank = maxi(rank_of(p.rp), 0)
+	# a new season: the old one is kept in the history (final RP and games played), the rating moves
+	# halfway back to 1000 (soft reset)
 	var now := season_now()
 	var season := str(p.get("season", ""))
 	if season != now:
 		if season != "":
-			p.hist[season] = p.rp
-			p.rp = int(p.rp / 2)
+			p.hist[season] = {"rp": p.rp, "g": p.sg}
+			p.rp = START_RP + int((p.rp - START_RP) / 2)
 		p["season"] = now
+		p.sg = 0
 	return p
+
+
+## Best final rank of a finished season the player really played (SEASON_MIN_GAMES ranked games).
+static func best_season_rank(p: Dictionary) -> int:
+	var best := -1
+	for key: String in p.hist:
+		var h: Variant = p.hist[key]
+		if h is Dictionary and int(h.get("g", 0)) >= SEASON_MIN_GAMES:
+			best = maxi(best, rank_of(int(h.get("rp", 0))))
+	return best
 
 
 static func _unlocked(rule: Array, p: Dictionary) -> bool:
@@ -170,6 +203,8 @@ static func _unlocked(rule: Array, p: Dictionary) -> bool:
 			return p.a.has(rule[1])
 		"rank":
 			return int(p.best_rank) >= int(rule[1])
+		"season":
+			return best_season_rank(p) >= int(rule[1])
 		"all":
 			for id: String in ACHIEVEMENTS:
 				var def: Array = ACHIEVEMENTS[id]
@@ -257,14 +292,33 @@ static func add_game(p: Dictionary, r: Dictionary) -> int:
 	return xp
 
 
-## Rank points for one game. Win +24, loss -16, plus up to +10 for play (kills / correct checks /
-## surviving); a loss with good play costs less; legendary ranks lose a little more. Unranked when
-## the game is too small or too short; the same group playing again within two hours earns half,
-## then nothing (no farming with friends). Returns {delta, ranked, reason, before, after}.
-static func rank_game(p: Dictionary, r: Dictionary, group: Array, players: int, rounds: int) -> Dictionary:
+## Elo step size: bigger for the first games (finds your level quickly), smaller at the top.
+static func k_factor(p: Dictionary) -> float:
+	if int(p.rk) < 10:
+		return 40.0
+	if int(p.rp) >= int(RANKS[LEGENDARY_RANK][1]):
+		return 20.0
+	return 28.0
+
+
+## Expected result (0..1) for a team with average rating `mine` against one with `theirs`.
+static func expected(mine: float, theirs: float) -> float:
+	return 1.0 / (1.0 + pow(10.0, (theirs - mine) / 400.0))
+
+
+## Rating change for one ranked game: Elo against the other team's average RP (`team_rp` = your
+## team's average, `opp_rp` = theirs, both measured before the game). Only the result counts - no
+## points for kills, chat or anything else that could be farmed. Unranked when the game is too small
+## or too short; the same group playing again within two hours gains half, then nothing (losses
+## still count). Returns {delta, ranked, reason, before, after, rp}.
+static func rank_game(p: Dictionary, r: Dictionary, group: Array, players: int, rounds: int, team_rp: float = -1.0, opp_rp: float = -1.0) -> Dictionary:
 	var before := rank_of(p.rp)
 	if players < RANKED_MIN_PLAYERS or rounds < RANKED_MIN_ROUNDS:
-		return {"delta": 0, "ranked": false, "reason": "too_small" if players < RANKED_MIN_PLAYERS else "too_short", "before": before, "after": before}
+		return {"delta": 0, "ranked": false, "reason": "too_small" if players < RANKED_MIN_PLAYERS else "too_short", "before": before, "after": before, "rp": p.rp}
+	if team_rp < 0.0:
+		team_rp = p.rp
+	if opp_rp < 0.0:
+		opp_rp = p.rp
 	var key := ",".join(group)
 	var now := int(Time.get_unix_time_from_system())
 	p.rg = p.rg.filter(func(g: Dictionary) -> bool: return now - int(g.get("t", 0)) < SAME_GROUP_WINDOW)
@@ -272,14 +326,10 @@ static func rank_game(p: Dictionary, r: Dictionary, group: Array, players: int, 
 	p.rg.append({"h": key.sha256_text(), "t": now})
 	while p.rg.size() > 8:
 		p.rg.pop_front()
-	var perf := mini(2, int(r.get("kills", 0))) * 3 + mini(2, int(r.get("correct_checks", 0))) * 3 + (4 if bool(r.get("survived", false)) else 0)
-	var delta := 0
-	if bool(r.get("won", false)):
-		delta = 24 + perf
-	else:
-		delta = -16 + int(perf / 2)
-		if before >= LEGENDARY_RANK:
-			delta = int(delta * 1.25)
+	var won := bool(r.get("won", false))
+	var delta := int(round(k_factor(p) * ((1.0 if won else 0.0) - expected(team_rp, opp_rp))))
+	if won:
+		delta = maxi(delta, 1)  # a win never costs points
 	var reason := ""
 	if repeats == 1 and delta > 0:
 		delta = int(delta / 2)
@@ -288,10 +338,11 @@ static func rank_game(p: Dictionary, r: Dictionary, group: Array, players: int, 
 		delta = 0
 		reason = "same_group"
 	p.rp = maxi(0, p.rp + delta)
+	p.rk = int(p.rk) + 1
+	p.sg = int(p.sg) + 1
 	var after := rank_of(p.rp)
 	p.best_rank = maxi(int(p.best_rank), after)
-	return {"delta": delta, "ranked": true, "reason": reason, "before": before, "after": after}
-
+	return {"delta": delta, "ranked": true, "reason": reason, "before": before, "after": after, "rp": p.rp}
 
 ## What the app gets: level and XP bar, rank and RP bar, stats, achievements, unlocked / equipped.
 static func summary(p: Dictionary) -> Dictionary:
@@ -303,4 +354,4 @@ static func summary(p: Dictionary) -> Dictionary:
 	return {"xp": p.xp, "level": lv[0], "xp_in": lv[1], "xp_need": lv[2], "stats": p.s, "achievements": p.a,
 		"frames": frames_of(p), "titles": titles_of(p), "frame": frame, "title": title,
 		"rp": p.rp, "rank": rank, "rank_min": int(RANKS[rank][1]), "rank_next": next_rp, "best_rank": p.best_rank,
-		"season": p.season, "hist": p.hist}
+		"season": p.season, "hist": p.hist, "season_games": p.sg, "ranked_games": p.rk, "best_season": best_season_rank(p)}

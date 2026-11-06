@@ -86,7 +86,8 @@ func handle(c: Object, m: Dictionary) -> void:
 		"equip":
 			await _equip(c, str(m.get("frame", "")), str(m.get("title", "")))
 		"leaderboard":
-			await _leaderboard(c, "friends" if str(m.get("scope", "")) == "friends" else "global")
+			var scope := str(m.get("scope", ""))
+			await _leaderboard(c, scope if scope in ["friends", "season", "country"] else "global")
 		"join_friend":
 			await _join_friend(c, str(m.get("id", "")))
 		"join_answer":
@@ -211,6 +212,7 @@ func send_friends(c: Object) -> void:
 			# how you can join them: "direct" (they allow it), "request" (they approve each time), "" = no
 			"join": ("direct" if friend_client.allow_join else "request") if playing else "",
 			"unread": int(unread.get(p.id, 0)),
+			"level": Progression.level_of(Progression.clean(p.get("progress")).xp)[0], "frame": _frame_of(p),
 		})
 	# people you blocked, so you can unblock them
 	var blocked_ids: Array = await store.blocked_by(me)
@@ -760,6 +762,12 @@ func block_alert(c: Object, room: Object) -> void:
 
 # --- progression: XP, levels, achievements, frames, titles (rules in progression.gd) ---
 
+## The frame a player wears (only if still unlocked).
+func _frame_of(p: Dictionary) -> String:
+	var prog := Progression.clean(p.get("progress"))
+	return prog.f if Progression.frames_of(prog).has(prog.f) else ""
+
+
 ## Level / frame / title for a player's seat in a room.
 func room_extra(c: Object) -> Dictionary:
 	return c.progress
@@ -771,12 +779,25 @@ func room_extra(c: Object) -> Dictionary:
 func record_match(results: Array, room: Object) -> void:
 	var accounts := results.map(func(r: Dictionary) -> String: return str(r.account))
 	var gid: String = room.game_id  # read now: the room may start another game while this runs
+	# first everyone's rating before the game, for the team averages (Elo is team against team)
+	var progs := {}
+	for r: Dictionary in results:
+		var p: Dictionary = await store.get_player(str(r.account))
+		if not p.is_empty():
+			progs[str(r.account)] = Progression.clean(p.get("progress"))
+	var sums := {"mafia": [0.0, 0], "town": [0.0, 0]}
+	for r: Dictionary in results:
+		if progs.has(str(r.account)):
+			var side := "mafia" if str(r.role) == "mafia" else "town"
+			sums[side][0] += float(progs[str(r.account)].rp)
+			sums[side][1] += 1
+	var avg := func(side: String) -> float:
+		return sums[side][0] / sums[side][1] if sums[side][1] > 0 else float(Progression.START_RP)
 	for r: Dictionary in results:
 		var account := str(r.account)
-		var p: Dictionary = await store.get_player(account)
-		if p.is_empty():
+		if not progs.has(account):
 			continue
-		var prog := Progression.clean(p.get("progress"))
+		var prog: Dictionary = progs[account]
 		if prog.g == gid:
 			continue  # already counted
 		prog.g = gid
@@ -786,10 +807,11 @@ func record_match(results: Array, room: Object) -> void:
 			return f.status == "accepted" and accounts.has(str(f.b if f.a == account else f.a)))
 		var before: int = Progression.level_of(prog.xp)[0]
 		var gained := Progression.add_game(prog, r)
-		var rank := Progression.rank_game(prog, r, r.get("group", accounts), int(r.get("players", accounts.size())), int(r.get("rounds", 0)))
+		var side := "mafia" if str(r.role) == "mafia" else "town"
+		var rank := Progression.rank_game(prog, r, r.get("group", accounts), int(r.get("players", accounts.size())), int(r.get("rounds", 0)),
+			avg.call(side), avg.call("town" if side == "mafia" else "mafia"))
 		var new: Array = Progression.check_achievements(prog)
 		await _save_progress(account, prog, new, before, gained, was, rank)
-
 
 ## +1 to a stat outside games (invites sent).
 func _bump(account: String, stat: String) -> void:
@@ -813,7 +835,7 @@ func _unlocks(prog: Dictionary) -> Array:
 ## `was` = _unlocks() before the change (new frames / titles are sent for the reward reveal),
 ## `rank` = Progression.rank_game() result.
 func _save_progress(account: String, prog: Dictionary, new: Array, level_before: int, gained: int, was: Array = [], rank: Dictionary = {}) -> void:
-	await store.update_player(account, {"progress": prog})
+	await store.update_player(account, {"progress": prog, "rp": prog.rp, "season": prog.season, "season_games": prog.sg, "ranked_games": prog.rk})
 	var sum := Progression.summary(prog)
 	var c: Object = online.get(account)
 	if c == null:
@@ -831,34 +853,53 @@ func _save_progress(account: String, prog: Dictionary, new: Array, level_before:
 		room.set_progress(account, sum.level, sum.frame, sum.title)
 
 
-## The season's leaderboard: everyone ("global", top 50) or you and your friends ("friends").
-## Your own place is sent too when you are not in the list.
+## Leaderboards: "global" (everyone who played ranked), "season" (ranked this season), "country"
+## (your country), "friends" (you and your friends). Top 100 rows, plus your own place even when you
+## are not in them ("you" = position, "me" = your row).
 func _leaderboard(c: Object, scope: String) -> void:
 	var season := Progression.season_now()
+	var p: Dictionary = await store.get_player(c.account)
+	var mine := Progression.clean(p.get("progress"))
+	var country := str(p.get("country", ""))
 	var rows: Array = []
-	if scope == "friends":
-		var ids := [c.account]
-		for f: Dictionary in await store.get_friendships(c.account):
-			if f.status == "accepted":
-				ids.append(str(f.b if f.a == c.account else f.a))
-		rows = await store.players_progress(ids)
-	else:
-		rows = await store.top_progress(season, 50)
+	var filter := {}
+	match scope:
+		"friends":
+			var ids := [c.account]
+			for f: Dictionary in await store.get_friendships(c.account):
+				if f.status == "accepted":
+					ids.append(str(f.b if f.a == c.account else f.a))
+			rows = await store.players_progress(ids)
+		"season":
+			filter = {"season": season}
+		"country":
+			filter = {"country": country}
+	if scope != "friends":
+		rows = await store.top_rated(filter, 100)
 	var list := []
-	for p: Dictionary in rows:
-		var prog := Progression.clean(p.get("progress"))
-		if scope != "friends" and prog.season != season:
-			continue
-		list.append({"id": str(p.id), "name": str(p.get("name", "")), "gender": str(p.get("gender", "")),
-			"country": str(p.get("country", "")), "tag": int(p.get("tag", 0)), "photo": str(p.get("photo", "")),
-			"rp": prog.rp, "rank": Progression.rank_of(prog.rp), "level": Progression.level_of(prog.xp)[0],
-			"frame": prog.f if Progression.frames_of(prog).has(prog.f) else "", "title": prog.t if Progression.titles_of(prog).has(prog.t) else ""})
+	for row: Dictionary in rows:
+		list.append(_board_row(row))
 	list.sort_custom(func(x: Dictionary, y: Dictionary) -> bool: return x.rp > y.rp)
-	var mine := -1
+	var me_row := _board_row(p)
+	var pos := -1
 	for i in list.size():
 		if list[i].id == c.account:
-			mine = i + 1
-	_send(c, {"t": "leaderboard", "scope": scope, "season": season, "rows": list, "you": mine})
+			pos = i + 1
+	var played: bool = mine.rk > 0 and (scope != "season" or (str(p.get("season", "")) == season and mine.sg > 0))
+	if pos < 0 and played and scope != "friends":
+		pos = await store.count_rated_above(filter, mine.rp) + 1  # your place outside the top 100
+	_send(c, {"t": "leaderboard", "scope": scope, "season": season, "country": country, "rows": list,
+		"you": pos, "me": me_row, "ranked": played})
+
+
+func _board_row(p: Dictionary) -> Dictionary:
+	var prog := Progression.clean(p.get("progress"))
+	var s: Dictionary = prog.s
+	return {"id": str(p.get("id", "")), "name": str(p.get("name", "")), "gender": str(p.get("gender", "")),
+		"country": str(p.get("country", "")), "tag": int(p.get("tag", 0)), "photo": _photo_of(p),
+		"rp": prog.rp, "rank": Progression.rank_of(prog.rp), "level": Progression.level_of(prog.xp)[0],
+		"wins": int(s.get("wins", 0)), "matches": int(s.get("matches", 0)),
+		"frame": prog.f if Progression.frames_of(prog).has(prog.f) else "", "title": prog.t if Progression.titles_of(prog).has(prog.t) else ""}
 
 ## Wear an unlocked frame / title ("" = none). Anything not unlocked is refused.
 func _equip(c: Object, frame: String, title: String) -> void:
