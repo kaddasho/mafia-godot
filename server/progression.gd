@@ -93,6 +93,32 @@ const FRAMES := {
 	"season_crown": [["season", 7], "legendary"],
 	"phantom_legend": [["all", "secret"], "mythic"],
 	"emperor_of_crime": [["all", "legendary"], "mythic"],
+	# premium layered frames (1.5)
+	"knight_shield": [["level", 15], "rare"],
+	"pink_diamond": [["level", 30], "epic"],
+	"sapphire_angel": [["level", 40], "epic"],
+	"casino_don": [["ach", "play_100"], "legendary"],
+	"emerald_serpents": [["ach", "wins_50"], "legendary"],
+	"ice_king": [["rank", 6], "epic"],
+	"eternal_sun": [["level", 50], "legendary"],
+	"crimson_devil": [["rank", 7], "legendary"],
+	"royal_crown": [["rank", 8], "legendary"],
+	"fire_throne": [["season", 9], "mythic"],
+	"violet_galaxy": [["level", 75], "mythic"],
+	"rainbow_legend": [["level", 100], "mythic"],
+	# second premium set: one every few levels, rare first, mythic last
+	"lightning": [["level", 8], "rare"],
+	"violet_night": [["level", 12], "epic"],
+	"royal_ice": [["level", 18], "epic"],
+	"eye_of_truth": [["level", 22], "epic"],
+	"rose_gold": [["level", 27], "epic"],
+	"golden_don": [["level", 33], "legendary"],
+	"black_emerald": [["level", 38], "legendary"],
+	"black_rose": [["level", 44], "legendary"],
+	"dark_knight": [["level", 55], "legendary"],
+	"mafia_king": [["level", 60], "legendary"],
+	"hellfire": [["level", 70], "mythic"],
+	"eternal_legend": [["level", 90], "mythic"],
 }
 
 const TITLES := {
